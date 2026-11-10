@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Log in or create account · {{ platform_name }}</title>
+  <link rel="icon" href="{{ url_for('static', filename='images/favicon.ico') }}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='images/favicon-32.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='images/apple-touch-icon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/tokens.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+<div class="login">
+  <section class="login-art">
+    <a class="brand" href="/login"><span class="brand-mark"><img src="{{ url_for('static', filename='images/codeskys-mark.png') }}" alt="" style="width:100%;height:100%;object-fit:contain"></span><span>{{ platform_name }}</span></a>
+    <h1>Ship your code to <em>the world.</em></h1>
+    <p>Connect a Git repository and {{ platform_name }} builds, deploys and hosts it — with live logs, instant rollbacks and your own domains.</p>
+    <div class="term" aria-hidden="true">
+      <div class="dots"><i></i><i></i><i></i></div>
+      <div><span class="p">$</span> codeskys deploy <span class="ac">portfolio-site</span></div>
+      <div class="p">→ Cloning repository · branch main</div>
+      <div class="p">→ Building (Next.js) · installing 428 packages</div>
+      <div class="ok">✓ Compiled successfully in 6.42s</div>
+      <div class="ok">✓ Live → https://portfolio-site.codeskys.com</div>
+    </div>
+    <div class="foot"><span>BUILD</span><span>DEPLOY</span><span>SCALE</span></div>
+  </section>
+  <section class="login-form-wrap">
+    <div class="login-card">
+      <a class="brand mobile-only" href="/login" style="margin-bottom:24px"><span class="brand-mark"><img src="{{ url_for('static', filename='images/codeskys-mark.png') }}" alt="" style="width:100%;height:100%;object-fit:contain"></span><span>{{ platform_name }}</span></a>
+      <h2 id="auth-title">Welcome back</h2>
+      <p class="sub" id="auth-subtitle">Sign in to your Codeskys workspace.</p>
+      <div class="auth-tabs" role="tablist" aria-label="Account access">
+        <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Log in</button>
+        <button class="auth-tab" id="register-tab" type="button" role="tab" aria-selected="false">Create account</button>
+      </div>
+      <form id="login-form" novalidate>
+        <div class="field hidden" id="name-field">
+          <label for="name">Your name</label>
+          <input class="input" id="name" name="name" type="text" autocomplete="name" placeholder="Your name" maxlength="80">
+        </div>
+        <div class="field">
+          <label for="email">Email address</label>
+          <input class="input" id="email" name="email" type="email" autocomplete="username" placeholder="you@example.com" required>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" minlength="12" required>
+          <span class="hint" id="password-hint">Use your Codeskys account password.</span>
+        </div>
+        <p id="login-error" class="form-error" role="alert" aria-live="polite"></p>
+        <button class="btn accent lg block" type="submit" id="login-btn">Log in</button>
+      </form>
+      <p class="auth-switch" id="auth-switch">New to Codeskys? <button type="button" id="switch-register">Create an account</button></p>
+      <div class="fine">
+        <svg class="i sm" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+        Protected with encrypted sessions and automatic lockout.
+      </div>
+    </div>
+  </section>
+</div>
+<script src="{{ url_for('static', filename='js/api.js') }}"></script>
+<script src="{{ url_for('static', filename='js/login.js') }}"></script>
+</body>
+</html>

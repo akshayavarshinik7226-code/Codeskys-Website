@@ -1,0 +1,124 @@
+/* Codeskys design tokens. Dark is the default; light follows the system or the user's choice. */
+:root {
+  color-scheme: dark;
+  --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --bg: #08090c;
+  --bg-2: #0d0f14;
+  --surface: #111319;
+  --surface-2: #161922;
+  --surface-3: #1d212c;
+  --hover: #1a1e28;
+  --line: #22262f;
+  --line-2: #2c313d;
+  --ink: #eceef3;
+  --ink-2: #b7bcc8;
+  --muted: #7d8495;
+  --faint: #545b6b;
+
+  --accent: #7c6cff;
+  --accent-2: #9d90ff;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(124, 108, 255, .14);
+  --accent-line: rgba(124, 108, 255, .38);
+
+  --live: #3ddc97;
+  --live-soft: rgba(61, 220, 151, .12);
+  --warn: #f5b84b;
+  --warn-soft: rgba(245, 184, 75, .12);
+  --bad: #ff6470;
+  --bad-soft: rgba(255, 100, 112, .12);
+  --info: #5cb8ff;
+  --info-soft: rgba(92, 184, 255, .12);
+
+  --log-bg: #07080b;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow: 0 1px 0 rgba(255, 255, 255, .03) inset, 0 12px 32px -12px rgba(0, 0, 0, .6);
+  --shadow-pop: 0 24px 64px -16px rgba(0, 0, 0, .7), 0 0 0 1px var(--line-2);
+  --ring: 0 0 0 3px rgba(124, 108, 255, .35);
+  --sidebar-w: 248px;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --bg-2: #eff1f4;
+  --surface: #ffffff;
+  --surface-2: #f7f8fa;
+  --surface-3: #eef0f4;
+  --hover: #f1f3f6;
+  --line: #e4e7ec;
+  --line-2: #d6dae2;
+  --ink: #12151c;
+  --ink-2: #3a4150;
+  --muted: #697184;
+  --faint: #9aa1b0;
+  --accent: #5b4cf0;
+  --accent-2: #4a3be0;
+  --accent-soft: rgba(91, 76, 240, .09);
+  --accent-line: rgba(91, 76, 240, .32);
+  --live: #0f9a63;
+  --live-soft: rgba(15, 154, 99, .1);
+  --warn: #b7770c;
+  --warn-soft: rgba(183, 119, 12, .1);
+  --bad: #d63645;
+  --bad-soft: rgba(214, 54, 69, .09);
+  --info: #1f7fd1;
+  --info-soft: rgba(31, 127, 209, .09);
+  --log-bg: #0c0e13;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 8px 24px -12px rgba(16, 24, 40, .12);
+  --shadow-pop: 0 24px 64px -16px rgba(16, 24, 40, .25), 0 0 0 1px var(--line);
+}
+
+/* Codeskys neon deployment-console palette — used by the authenticated product UI. */
+:root {
+  --bg: #05091b;
+  --bg-2: #080f27;
+  --surface: #0b1430;
+  --surface-2: #101c3c;
+  --surface-3: #17264b;
+  --hover: #17264a;
+  --line: rgba(117, 145, 220, .16);
+  --line-2: rgba(139, 160, 235, .28);
+  --ink: #f4f6ff;
+  --ink-2: #c4cce5;
+  --muted: #8997bc;
+  --faint: #5d6c96;
+  --accent: #7047ff;
+  --accent-2: #a77aff;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(119, 75, 255, .16);
+  --accent-line: rgba(150, 112, 255, .42);
+  --info: #36b9ff;
+  --info-soft: rgba(54, 185, 255, .13);
+  --log-bg: #030718;
+  --radius: 13px;
+  --radius-lg: 18px;
+  --shadow: 0 1px 0 rgba(255,255,255,.035) inset, 0 18px 48px -28px rgba(0,0,0,.8);
+  --shadow-pop: 0 28px 80px -24px rgba(0,0,0,.85), 0 0 0 1px rgba(139,160,235,.22);
+  --ring: 0 0 0 3px rgba(124, 91, 255, .3);
+}
+html[data-theme="light"] {
+  --bg: #f5f7ff;
+  --bg-2: #edf1ff;
+  --surface: #ffffff;
+  --surface-2: #f7f8ff;
+  --surface-3: #edf0ff;
+  --hover: #f0f2ff;
+  --line: #e0e5f5;
+  --line-2: #cbd4ed;
+  --ink: #101936;
+  --ink-2: #354365;
+  --muted: #68779b;
+  --faint: #9aa6c3;
+  --accent: #6545ed;
+  --accent-2: #805cff;
+  --accent-soft: rgba(101,69,237,.09);
+  --accent-line: rgba(101,69,237,.28);
+  --info: #168ed8;
+  --info-soft: rgba(22,142,216,.09);
+  --shadow: 0 1px 2px rgba(16,24,40,.04), 0 12px 32px -18px rgba(30,45,90,.2);
+  --shadow-pop: 0 24px 64px -20px rgba(16,24,40,.22), 0 0 0 1px var(--line);
+}

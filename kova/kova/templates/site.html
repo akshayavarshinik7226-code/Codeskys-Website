@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ project.name }}</title><link rel="stylesheet" href="{{ url_for('static', filename='css/site.css') }}"></head>
+<body>
+{% if is_preview %}<div class="bar">Preview of deploy #{{ dep.number }} · {{ dep.branch }} · not the production version</div>{% endif %}
+<main>
+  <div class="badge"><span class="dot"></span> Live on Codeskys</div>
+  <h1>{{ project.name }}</h1>
+  <p class="lead">{{ project.description or "This site was built from " ~ project.repo_full_name ~ " and published by Codeskys." }}</p>
+  <dl>
+    <div><dt>Repository</dt><dd><a href="{{ project.repo_url }}" rel="noopener">{{ project.repo_full_name }}</a></dd></div>
+    <div><dt>Branch</dt><dd>{{ dep.branch }}</dd></div>
+    <div><dt>Commit</dt><dd><code>{{ dep.commit_sha[:7] }}</code> {{ dep.commit_message }}</dd></div>
+    <div><dt>Framework</dt><dd>{{ framework }}</dd></div>
+    <div><dt>Deploy</dt><dd>#{{ dep.number }} · {{ dep.finished_at[:16].replace('T', ' ') }} UTC</dd></div>
+  </dl>
+  <p class="note">Simulated hosting. When Coolify is connected, this address serves the real build of your repository.</p>
+</main>
+<footer>Deployed with <strong>Codeskys</strong></footer>
+</body></html>

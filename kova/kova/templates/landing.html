@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <meta name="description" content="Codeskys.com — build, deploy and ship your projects with confidence.">
+  <title>Codeskys.com — Your code deserves an audience</title>
+  <link rel="icon" href="{{ url_for('static', filename='images/favicon.ico') }}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='images/favicon-32.png') }}">
+  <link rel="icon" type="image/png" sizes="192x192" href="{{ url_for('static', filename='images/favicon-192.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='images/apple-touch-icon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/landing.css') }}">
+</head>
+<body>
+<header class="nav">
+  <a class="logo" href="/"><img class="logo-mark" src="{{ url_for('static', filename='images/codeskys-mark.png') }}" alt="" width="40" height="27"><span class="logo-text">Codeskys<b>.com</b></span></a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <div class="nav-menu"><a href="#platform-catalog" aria-haspopup="true">Platform <span>⌄</span></a><div class="nav-dropdown">
+      <a href="#cap-deploy">Deployments</a><a href="#cap-previews">Deploy Previews</a><a href="#cap-runners">Agent &amp; Build Runners</a><a href="#cap-devops">DevOps</a><a href="#cap-compute">Cloud Compute</a><a href="#cap-data">Data &amp; Storage</a><a href="#cap-security">Web Security</a><a href="#cap-observe">Observability</a><a href="#cap-functions">Functions</a><a href="#cap-ai">AI Gateway</a><a href="#cap-edge">Edge Network</a><a href="#cap-forms">Forms</a>
+    </div></div>
+    <div class="nav-menu"><a href="#solutions" aria-haspopup="true">Solutions <span>⌄</span></a><div class="nav-dropdown">
+      <a href="#solution-ai">AI Applications</a><a href="#solution-saas">SaaS Applications</a><a href="#solution-business">Business Websites</a><a href="#solution-shop">E-commerce</a><a href="#solution-portfolio">Developer Portfolios</a><a href="#solution-api">API Applications</a><a href="#solution-student">Student Projects</a>
+    </div></div>
+    <div class="nav-menu"><a href="#developers" aria-haspopup="true">Developers <span>⌄</span></a><div class="nav-dropdown">
+      <a href="#dev-docs">Documentation</a><a href="#dev-cli">CLI &amp; API</a><a href="#dev-git">Git Integrations</a><a href="#dev-hooks">Webhooks</a><a href="#dev-frameworks">Framework Guides</a><a href="#dev-support">Support</a>
+    </div></div>
+    <a href="#features">Resources</a><a href="#pricing">Pricing</a>
+  </nav>
+  <div class="nav-actions"><a class="nav-login" href="{{ url_for('pages.login_page') }}">Log in</a><a class="nav-cta" href="{{ url_for('pages.login_page') }}">Dashboard <span>↗</span></a><button class="mobile-menu" aria-label="Open menu" onclick="document.body.classList.toggle('menu-open')">☰</button></div>
+</header>
+<main>
+  <section class="hero" id="platform">
+    <div class="hero-copy">
+      <div class="eyebrow"><span class="pulse"></span> DEPLOY · MANAGE · SCALE</div>
+      <h1>Your code<br>deserves an<br><span>audience.</span></h1>
+      <p class="hero-sub">Create with code and deploy to the web. Connect your repository, ship your project, and manage every release from one platform.</p>
+      <div class="hero-actions"><a class="primary" href="{{ url_for('pages.login_page') }}">Start building <span>↗</span></a><a class="secondary" href="#workflow">Watch the workflow <span>↓</span></a></div>
+      <div class="terminal" aria-label="Example deployment activity">
+        <div class="terminal-top"><div class="dots"><i></i><i></i><i></i></div><span>Codeskys.com — deployment workflow</span><b>● READY TO DEPLOY</b></div>
+        <div class="terminal-lines" id="terminal-lines">
+          <p><span class="prompt">$</span> codeskys deploy <em>your-next-project</em></p>
+          <p class="muted">↳ Connect GitHub or GitLab repository</p>
+          <p class="muted">↳ Build · deploy · monitor</p>
+          <p class="success">✓ Build logs and status in one place</p>
+          <p class="success">✓ Automatic redeploys on Git push</p>
+          <p class="live-line"><span class="live-dot"></span> <span>Live URL appears here after a successful deployment</span></p>
+        </div>
+      </div>
+      <div class="trust-line"><span>YOUR STACK, YOUR WORKFLOW</span><div class="trust-tags"><b>GITHUB</b><b>GITLAB</b><b>REACT</b><b>NEXT.JS</b><b>VUE</b></div></div>
+    </div>
+    <div class="hero-visual"><img src="{{ url_for('static', filename='images/kova-hero.png') }}" alt="Illustration of code, cloud deployment, servers and a rocket launching"/><div class="float-card build-card"><span class="card-icon">✓</span><span><b>Build successful</b><small>Ready for deployment</small></span></div><div class="float-card uptime-card"><span class="uptime-bars">▂ ▄ ▅ ▇ ▆ ▇</span><small>DEPLOYMENT ACTIVITY</small><b>All systems go</b></div></div>
+  </section>
+  <div class="ticker" aria-label="Codeskys.com platform capabilities"><div class="ticker-track"><span>✳ ONE-CLICK DEPLOYMENTS</span><i>✦</i><span>GITHUB &amp; GITLAB</span><i>✦</i><span>LIVE BUILD LOGS</span><i>✦</i><span>AUTOMATIC REDEPLOYS</span><i>✦</i><span>PRIVATE REPOSITORIES</span><i>✦</i><span>DEPLOYMENT HISTORY</span><i>✦</i><span>ROLLBACKS</span><i>✦</i><span>CUSTOM DOMAINS</span><i>✦</i><span>24-HOUR PREVIEWS</span><i>✦</i><span>ONE-CLICK DEPLOYMENTS</span><i>✦</i><span>GITHUB &amp; GITLAB</span><i>✦</i><span>LIVE BUILD LOGS</span><i>✦</i><span>AUTOMATIC REDEPLOYS</span><i>✦</i><span>PRIVATE REPOSITORIES</span><i>✦</i><span>DEPLOYMENT HISTORY</span><i>✦</i><span>ROLLBACKS</span><i>✦</i><span>CUSTOM DOMAINS</span><i>✦</i><span>24-HOUR PREVIEWS</span><i>✦</i></div></div>
+  <section class="below" id="workflow"><div class="section-kicker">YOUR CODE. YOUR FLOW.</div><h2>Everything you need to<br><span>ship with confidence.</span></h2><p class="section-sub">A clear path from your first push to every release after it.</p><div class="steps"><article><span>01 / CONNECT</span><div class="step-icon">⌘</div><h3>Connect your repo</h3><p>Bring a GitHub or GitLab repository and choose the branch you want to ship.</p></article><article><span>02 / BUILD</span><div class="step-icon">⌁</div><h3>Build automatically</h3><p>Codeskys detects your project and runs the build with visible logs and status.</p></article><article><span>03 / SHIP</span><div class="step-icon">↗</div><h3>Go live</h3><p>Get a shareable deployment URL and manage releases from your dashboard.</p></article></div></section>
+  <section class="feature-band" id="features"><div><div class="section-kicker">MADE FOR BUILDERS</div><h2>Less setup.<br><span>More shipping.</span></h2></div><div class="feature-pills"><span>Live deployment logs</span><span>Git push redeploys</span><span>Preview deployments</span><span>Deployment history</span><span>Rollbacks</span><span>Environment variables</span><span>Custom domains</span><span>Project analytics</span></div></section>
+  <section class="platform-catalog" id="platform-catalog">
+    <div class="catalog-intro"><div class="section-kicker">ONE PLATFORM · CONNECTED WORKFLOWS</div><h2>Explore the Codeskys.com<br><span>platform.</span></h2><p>Open each area to understand what it does. Live capabilities are clearly separated from modules that still require an external provider or runtime.</p></div>
+    <div class="catalog-grid">
+      <article id="cap-deploy"><span class="cap-status active">Available</span><div class="cap-icon">↗</div><h3>Deployments</h3><p>Connect a Git repository, configure builds, deploy, inspect logs and roll back releases.</p><a href="{{ url_for('pages.login_page') }}">Open Codeskys.com ↗</a></article>
+      <article id="cap-previews"><span class="cap-status active">Available</span><div class="cap-icon">◫</div><h3>Deploy Previews</h3><p>Create isolated preview deployments and inspect their status before promoting a release.</p><a href="{{ url_for('pages.login_page') }}">Explore previews ↗</a></article>
+      <article id="cap-runners"><span class="cap-status active">Build jobs available</span><div class="cap-icon">⚙</div><h3>Agent &amp; Build Runners</h3><p>Durable deployment workers with job leases, retries and build history. AI code-editing agents are not connected yet.</p><a href="{{ url_for('pages.login_page') }}">View build activity ↗</a></article>
+      <article id="cap-devops"><span class="cap-status active">Available</span><div class="cap-icon">⌘</div><h3>DevOps</h3><p>GitHub/GitLab connections, verified webhooks, automatic redeploys and scoped API tokens.</p><a href="{{ url_for('pages.login_page') }}">Open DevOps ↗</a></article>
+      <article id="cap-compute"><span class="cap-status setup">Coolify required</span><div class="cap-icon">▦</div><h3>Cloud Compute</h3><p>Configure application CPU, memory and runtime limits. Live resource metrics depend on the server provider.</p><a href="{{ url_for('pages.login_page') }}">View compute settings ↗</a></article>
+      <article id="cap-data"><span class="cap-status setup">Provider required</span><div class="cap-icon">▤</div><h3>Data &amp; Storage</h3><p>Managed per-project databases, object storage and persistent volumes require a configured provider.</p><a href="{{ url_for('pages.login_page') }}">View integrations ↗</a></article>
+      <article id="cap-security"><span class="cap-status active">Core controls available</span><div class="cap-icon">◇</div><h3>Web Security</h3><p>Account roles, CSRF protection, rate limits, encrypted provider tokens and project secret controls.</p><a href="{{ url_for('pages.login_page') }}">Open security ↗</a></article>
+      <article id="cap-observe"><span class="cap-status active">Deployment analytics</span><div class="cap-icon">⌁</div><h3>Observability</h3><p>Build logs, deployment outcomes, recorded build durations and project activity. Runtime traces require instrumentation.</p><a href="{{ url_for('pages.login_page') }}">Open analytics ↗</a></article>
+      <article id="cap-functions"><span class="cap-status setup">Runtime required</span><div class="cap-icon">λ</div><h3>Functions</h3><p>A separate serverless-function runtime and lifecycle controller are not yet configured.</p><a href="{{ url_for('pages.login_page') }}">View platform ↗</a></article>
+      <article id="cap-ai"><span class="cap-status setup">AI provider required</span><div class="cap-icon">✧</div><h3>AI Gateway</h3><p>Provider routing, key management, request metering and model analytics require an AI gateway implementation.</p><a href="{{ url_for('pages.login_page') }}">View platform ↗</a></article>
+      <article id="cap-edge"><span class="cap-status setup">CDN required</span><div class="cap-icon">◎</div><h3>Edge Network</h3><p>Global CDN delivery, cache invalidation and edge analytics require an external edge provider.</p><a href="{{ url_for('pages.login_page') }}">View platform ↗</a></article>
+      <article id="cap-forms"><span class="cap-status active">Available</span><div class="cap-icon">▧</div><h3>Forms</h3><p>Create project-scoped submission endpoints, validate submissions and export captured data.</p><a href="{{ url_for('pages.login_page') }}">Manage forms ↗</a></article>
+    </div>
+  </section>
+  <section class="solutions-band" id="solutions"><div class="section-kicker">BUILT FOR REAL PROJECTS</div><h2>One workflow for<br><span>different kinds of apps.</span></h2><div class="solution-grid">
+    <article id="solution-ai"><b>AI applications</b><p>Deploy AI-powered frontends and APIs with environment secrets kept server-side.</p></article>
+    <article id="solution-saas"><b>SaaS applications</b><p>Ship web apps with repository automation, domains and deployment history.</p></article>
+    <article id="solution-business"><b>Business websites</b><p>Publish static and framework-based websites from connected repositories.</p></article>
+    <article id="solution-shop"><b>E-commerce</b><p>Deploy storefront applications and connect the services they require.</p></article>
+    <article id="solution-portfolio"><b>Developer portfolios</b><p>Publish personal sites and project showcases with a shareable URL.</p></article>
+    <article id="solution-api"><b>API applications</b><p>Deploy supported backend services as provider-managed applications.</p></article>
+    <article id="solution-student"><b>Student projects</b><p>Manage individual projects and short-lived deployment links in one workspace.</p></article>
+  </div></section>
+  <section class="developers-band" id="developers"><div><div class="section-kicker">FOR DEVELOPERS</div><h2>Tools that fit<br><span>your workflow.</span></h2></div><div class="developer-links">
+    <a id="dev-docs" href="{{ url_for('pages.login_page') }}">Documentation <span>↗</span></a><a id="dev-cli" href="{{ url_for('pages.login_page') }}">CLI &amp; API <span>↗</span></a><a id="dev-git" href="{{ url_for('pages.login_page') }}">Git integrations <span>↗</span></a><a id="dev-hooks" href="{{ url_for('pages.login_page') }}">Webhooks <span>↗</span></a><a id="dev-frameworks" href="{{ url_for('pages.login_page') }}">Framework guides <span>↗</span></a><a id="dev-support" href="{{ url_for('pages.login_page') }}">Support <span>↗</span></a>
+  </div></section>
+  <section class="pricing" id="pricing"><div><div class="section-kicker">SIMPLE STUDENT ACCESS</div><h2>Build something<br><span>worth sharing.</span></h2></div><div class="price-card"><small>STUDENT PLAN</small><div class="price">₹500 <span>/ 6 months</span></div><p>Platform access for your projects. Individual deployments have their own 24-hour lifetime.</p><a class="primary" href="{{ url_for('pages.login_page') }}">Get started <span>↗</span></a><small class="price-note">Payments become available once the payment provider is configured.</small></div></section>
+</main>
+<footer><a class="logo" href="/"><img class="logo-mark" src="{{ url_for('static', filename='images/codeskys-mark.png') }}" alt="" width="40" height="27"><span class="logo-text">Codeskys<b>.com</b></span></a><span>Your code deserves an audience. Codeskys.com</span><a href="{{ url_for('pages.login_page') }}">Open dashboard ↗</a></footer>
+
+</body></html>
