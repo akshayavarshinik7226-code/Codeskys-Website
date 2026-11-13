@@ -33,9 +33,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     from .webhooks import bp as webhooks_bp
     from .forms import bp as forms_bp
     from .billing import bp as billing_bp
+    from .tlsask import bp as tlsask_bp
 
     for blueprint in (auth_bp, status_bp, pages_bp, projects_bp, account_bp, admin_bp, sites_bp,
-                      providers_bp, webhooks_bp, forms_bp, billing_bp):
+                      providers_bp, webhooks_bp, forms_bp, billing_bp, tlsask_bp):
         app.register_blueprint(blueprint)
 
     # Job handlers register themselves on import; the worker needs them loaded.

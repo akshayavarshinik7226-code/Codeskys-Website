@@ -62,7 +62,8 @@ None of these are code gaps — they need credentials or a server that only you 
 | GitHub sign-in | An OAuth App; set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | The Connect button explains it is not configured; public repos still work by URL |
 | GitLab sign-in | An OAuth application; set `GITLAB_CLIENT_ID` / `GITLAB_CLIENT_SECRET` | Same |
 | Real deployments | A Coolify server: URL, API token, project uuid, server uuid | Builds run on the simulator and are labelled as such |
-| Private repository deploys | A Coolify deploy key (`COOLIFY_PRIVATE_KEY_UUID`) with its public half added to the repo | The build fails with an instruction saying exactly this |
+| Real deployments on Coolify | Coolify 4.7.5 (Services API), a public GitHub repository, linked to Codeskys authorization, and the wildcard base domain | The build fails with a message saying which of these is missing. Coolify's automatic build packs are never used: they build with host networking. Protected Codeskys services (runtime sidecar) are not available to Coolify deployments: Coolify cannot keep the sidecar's network away from the app |
+| Private repository deploys | Not available on Coolify yet (the build needs a read-only clone path) | The build is refused with that message |
 | Custom project domains | A wildcard DNS record pointing at the Coolify server | The free `<slug>.codeskys.com` subdomain still works |
 | Incoming webhooks | A publicly reachable `KOVA_PUBLIC_URL` | Deploy from the dashboard instead |
 
@@ -154,7 +155,7 @@ GitHub must be able to reach your callback URL. For local work, create an OAuth 
 6. **In Codeskys → Integrations → Coolify**, fill in the instance URL and token and press **Test connection**. Codeskys lists your servers, projects and deploy keys; click to select them, then **Save**.
 7. Set the base domain to `apps.yourdomain.com`.
 8. Switch the engine to **Coolify**. Deploy one project and watch the log.
-9. **For private repositories**: in Coolify → Keys & Tokens → Private Keys, create a key; add its public half as a deploy key on the repository (GitHub → Settings → Deploy keys). Put the key's uuid in `COOLIFY_PRIVATE_KEY_UUID` or the Integrations field.
+9. **Private repositories** are refused on Coolify for now (see the table above); the deploy-key and GitHub App settings are kept for when the sidecar build supports them.
 10. **For automatic redeploys**: open a project's Settings in Codeskys, copy the GitHub (or GitLab) webhook URL, and add it in the repository's webhook settings. Codeskys shows the URL; the signing secret stays on the server.
 
 Equivalent environment variables, if you prefer configuring by file:
@@ -188,7 +189,7 @@ node --check kova/static/js/app.js
 | `test_platform` | 20 | projects, deployments, ownership, env vars, domains, API tokens, admin members |
 | `test_queue` | 18 | claim/lease, dedupe, two-worker exclusion, lease reclaim, retries and give-up, heartbeat, sweep rescue, TTL assignment, expiry, idempotent expiry, expired site stops serving |
 | `test_providers` | 24 | encryption round-trip and tamper detection, OAuth config gating, forged `state` rejection, encrypted token storage, token never exposed, repo/branch listing, disconnect, GitHub signature valid/invalid/missing, unknown hook, duplicate delivery, wrong branch, same-commit guard, ping, auto-deploy off, branch deletion, GitLab token valid/invalid/duplicate |
-| `test_coolify` | 15 | full lifecycle against a mocked Coolify, POST `/deploy` with GET fallback, failed build reported as failed, API errors surfaced, unreachable server, private repo with and without a deploy key, cancellation, teardown stop+delete, **refusal to delete a non-Codeskys application**, superseded deployment left alone, connection test, token never returned, half-configured Coolify falling back to the simulator |
+| `test_coolify` | 21 | full lifecycle against a mocked Coolify, POST `/deploy` with GET fallback, failed build reported as failed, API errors surfaced, unreachable server, private repos refused, **build isolation: only the generated compose build pack, non-Dockerfile projects and host-network/insecure/device Dockerfiles refused before a credential exists, other build packs, custom build/start commands, run options and tampered compose files block build and start**, cancellation, teardown stop+delete, **refusal to delete a non-Codeskys application**, superseded deployment left alone, connection test, token never returned, half-configured Coolify falling back to the simulator |
 | `test_admin_security` | 20 | admin overview, filters, force expire, stop build, queue retry, settings validation, TTL inheritance, student/anonymous authorization boundaries, students cannot raise build limits, input validation, rate limits per bucket and across restarts, login and deploy throttling |
 | `test_forms` | 6 | project-scoped form creation/listing, public submission validation and storage, invalid schema rejection, pause behavior, owner isolation, deletion and submission invalidation |
 

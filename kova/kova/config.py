@@ -74,6 +74,15 @@ def build_config() -> dict:
         "COOLIFY_DESTINATION_UUID": os.environ.get("COOLIFY_DESTINATION_UUID", "").strip(),
         # Until codeskys.com has HTTPS, test apps are served over plain HTTP.
         "COOLIFY_FORCE_HTTPS": os.environ.get("COOLIFY_FORCE_HTTPS", "1") == "1",
+        # Caddy terminates TLS for app hostnames (on-demand certificates, approved by
+        # /internal/tls-ask). Coolify/Traefik then get plain http:// domains, so Traefik
+        # never requests certificates or redirects, while students see https:// URLs.
+        "COOLIFY_TLS_AT_EDGE": os.environ.get("COOLIFY_TLS_AT_EDGE", "0") == "1",
+        # A deployment is "ready" only once its app runs and answers HTTP. Seconds to wait
+        # after the build, and an optional in-server probe target (Traefik, e.g.
+        # http://coolify-proxy:80) used with the app's Host header instead of its public URL.
+        "COOLIFY_READY_TIMEOUT": int(os.environ.get("COOLIFY_READY_TIMEOUT", "180") or 180),
+        "COOLIFY_PROBE_URL": os.environ.get("COOLIFY_PROBE_URL", "").strip().rstrip("/"),
         # Codeskys authorization service (ForgeOps authz), see
         # forgeops/authz/WEBSITE_INTEGRATION.md. Server-side only; the website key opens
         # /internal/website/* only and never reaches a browser.

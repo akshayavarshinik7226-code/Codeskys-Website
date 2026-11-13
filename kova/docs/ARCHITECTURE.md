@@ -95,19 +95,21 @@ Only a *production* deployment that reaches `ready` updates `projects.current_de
 
 **Simulator** writes a realistic log for the project's framework and serves the result from `sites.py`. It never executes repository code.
 
-**Coolify** calls, in order:
+**Coolify** (4.7.5, Services API; checked against `openapi.yaml`, `routes/api.php` and `ServicesController.php` at the `v4.7.5` tag) calls, in order:
 
 | Step | Coolify v1 endpoint |
 | --- | --- |
-| Create application (first deploy) | `POST /applications/public` |
-| Sync build settings (later deploys) | `PATCH /applications/{uuid}` |
-| Sync environment variables | `PATCH /applications/{uuid}/envs/bulk` |
-| Trigger the build | `GET /deploy?uuid=…&force=…` |
-| Poll status and logs | `GET /deployments/{uuid}` |
-| Cancel | `POST /deployments/{uuid}/cancel` |
-| Delete on project removal | `DELETE /applications/{uuid}` |
+| Create the project's service (first deploy) | `POST /services` (generated compose, base64; `urls` for `app` only; `connect_to_docker_network: false`; ownership marker in `description`; `instant_deploy: false`) |
+| Replace the compose file (later deploys) | `GET` (ownership) then `PATCH /services/{uuid}` |
+| Sync environment variables | `PATCH /services/{uuid}/envs/bulk` (`is_literal`) |
+| Verify the service before every build/start | `GET /services/{uuid}` |
+| Build and start | `POST /services/{uuid}/start`, or `/restart` when Coolify answers "already running" |
+| Progress | `GET /services/{uuid}` `status` (`starting:…` while the build runs; no deployment id or build log exists for services) |
+| Cancel | `POST /services/{uuid}/stop`, plus a durable `coolify_quiesce` job that stops it again if the build still finishes |
+| App output on failure | `GET /services/{uuid}/logs` (needs `read:sensitive`; the Codeskys token is refused and no output is shown) |
+| Expiry / project deletion | ownership check, `POST …/stop`, `DELETE /services/{uuid}` |
 
-Build-pack selection: `dockerfile` for Dockerfile projects, `static` for static projects with no build command, otherwise `nixpacks`.
+Build path: **only** a Coolify service made from a compose file Codeskys generates (`composegen.generate_service`: the student's `app` container alone, no networks, volumes or ports, build section limited to `context` and `dockerfile`). Coolify 4.7.5 has no endpoint that creates an application from a raw compose file, and its build packs (nixpacks, dockerfile, static, railpack) run `docker build --network host`, which would let a student's `RUN` step reach every loopback service and container on the server, so they are never used. Coolify's `serviceParser` attaches **every** top-level network of a compose file to **every** container and never removes networks a compose file creates, so the app + runtime-sidecar layout (`composegen.generate`) cannot be kept apart inside a Coolify service: Coolify deployments run without the sidecar and request no deployment credential (protected Codeskys services refuse them, which the build log states). Each service gets its own Docker network, shared only with `coolify-proxy`. `engine.coolify_refusal` refuses projects that are not public and authz-linked. Framework projects (13 presets) build from a Dockerfile Codeskys generates (`dockerfiles.py`: pinned base images, student commands only as one JSON-quoted exec-form argument, unprivileged runtime, static sites on nginx-unprivileged:8080) carried inline as `build.dockerfile_inline` and checked line by line by `composegen.assert_safe_service`; `docker` projects build their own Dockerfile; `buildpolicy.py` refuses Dockerfiles that ask for host networking, insecure mode, devices or a custom `# syntax` frontend, and refuses to build or start a Coolify service that is a template, joined to the destination network, has any container besides `app`, or (when Coolify shows it) stores a compose file other than the one Codeskys generated. Only services with the uuid, name and ownership marker Codeskys gave them are ever changed, stopped or deleted. BuildKit itself refuses `RUN --network=host` / `--security=insecure` (also from a base image's `ONBUILD`) unless the compose file grants it, which `composegen.assert_safe_service` never allows.
 
 ## Security
 

@@ -31,6 +31,7 @@ class FakeAuthz:
         self.deploy_status = 200
         self.down = False
         self.registered_repo = REPO
+        self.registered_repo_id = None     # the project object's repository.github_repo_id
         self.revoked = []
 
     def deny(self, status, code, message="", ref="REQ-TEST00000001"):
@@ -41,7 +42,10 @@ class FakeAuthz:
         return {"project_id": pid, "project_name": "Web App", "repo_url": self.registered_repo,
                 "can_deploy": self.can_deploy, "state": "active" if self.can_deploy else "project_suspended",
                 "code": "" if self.can_deploy else authz_client.POLICY, "suspended": not self.can_deploy,
-                "repository": None, "deployments": []}
+                "repository": None if self.registered_repo_id is None else
+                {"github_repo_id": self.registered_repo_id, "full_name": "acme/web-app", "private": False,
+                 "verified_by": "github_api", "github_app_installed": False},
+                "deployments": []}
 
     def __call__(self, method, url, headers=None, json=None, **kw):
         path = url.split("/internal/website", 1)[1]
@@ -165,6 +169,8 @@ class ClientContractTests(CoolifyCase):
 
 
 class EngineAuthorizationTests(CoolifyCase):
+    auto_link = False                     # these tests link through the admin API
+
     def setUp(self):
         super().setUp()
         self.secret_dir = tempfile.mkdtemp()
@@ -199,38 +205,38 @@ class EngineAuthorizationTests(CoolifyCase):
                          for r in conn.execute(f"SELECT * FROM {t}"))
         return dump + json.dumps([c["json"] for c in self.coolify.calls])
 
-    def test_linked_project_without_sidecar_requests_no_credential(self):
-        slug = self.linked_project()
-        d = self.deploy(slug)
-        self.assertEqual(d["status"], "ready", d)
-        self.assertFalse(any(c["path"] == "/deployments" for c in self.authz.calls),
-                         "no runtime credential may be requested when there is nowhere safe to put it")
-        self.assertNotIn(RUNTIME_SECRET, self.everything_recorded())
+    def test_coolify_builds_without_a_sidecar_and_requests_no_credential(self):
+        for sink in ("", "secret-dir"):
+            with self.subTest(sink=sink):
+                self.app.config["RUNTIME_SECRET_DIR"] = self.secret_dir if sink else ""
+                conn = self.app_conn()
+                conn.execute("DELETE FROM deployments")
+                conn.execute("DELETE FROM projects")
+                conn.commit()
+                self.authz.calls.clear()
+                slug = self.linked_project()
+                d = self.deploy(slug)
+                self.assertEqual(d["status"], "ready", d)
+                self.assertFalse(any(c["path"] == "/deployments" for c in self.authz.calls),
+                                 "Coolify cannot isolate a sidecar, so no runtime credential is requested")
+                self.assertTrue(any(c["path"].endswith("/repository") for c in self.authz.calls),
+                                "the repository is still verified with GitHub through authz")
+                self.assertFalse(d["authz_deployment_id"])
+                self.assertEqual(os.listdir(self.secret_dir), [])
+                self.assertNotIn(RUNTIME_SECRET, self.everything_recorded())
 
-    def test_runtime_secret_goes_only_to_the_sidecar_file(self):
+    def test_runtime_secret_is_never_put_in_the_compose_file_or_coolify_envs(self):
         self.app.config["RUNTIME_SECRET_DIR"] = self.secret_dir
         slug = self.linked_project()
-        d = self.deploy(slug)
-        self.assertEqual(d["status"], "ready", d)
-        self.assertEqual(d["authz_deployment_id"], "dep_abcdef0123456789")
-        path = os.path.join(self.secret_dir, "dep_abcdef0123456789", "runtime_secret")
-        with open(path, encoding="utf-8") as fh:
-            self.assertEqual(fh.read(), RUNTIME_SECRET)
-        if os.name == "posix":
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-        recorded = self.everything_recorded()
-        self.assertNotIn(RUNTIME_SECRET, recorded, "secret leaked into DB, logs or a Coolify env var")
-        envs = [e for c in self.coolify.calls if c["path"].endswith("/envs/bulk") for e in c["json"]["data"]]
-        self.assertNotIn("CODESKYS_RUNTIME_SECRET", {e["key"] for e in envs})
-        # app + sidecar go to Coolify as a generated compose file (base64)
+        self.assertEqual(self.deploy(slug)["status"], "ready")
         import base64
-        create = next(c for c in self.coolify.calls if c["path"] == "/applications/dockercompose")["json"]
+        create = next(c for c in self.coolify.calls if (c["method"], c["path"]) == ("POST", "/services"))["json"]
         compose = json.loads(base64.b64decode(create["docker_compose_raw"]))
-        self.assertNotIn(RUNTIME_SECRET, json.dumps(compose))
-        rt = compose["services"]["codeskys-runtime"]
-        self.assertEqual(rt["environment"]["CODESKYS_DEPLOYMENT_ID"], "dep_abcdef0123456789")
-        self.assertTrue(rt["volumes"][0]["source"].endswith("dep_abcdef0123456789/runtime_secret"))
-        self.assertNotIn("link", compose["services"]["app"]["networks"])
+        self.assertEqual(set(compose["services"]), {"app"}, "no sidecar inside a Coolify service")
+        self.assertFalse({"CODESKYS_RUNTIME_URL", "CODESKYS_DEPLOYMENT_ID", "CODESKYS_RUNTIME_SECRET"}
+                         & set(compose["services"]["app"]["environment"]))
+        envs = [e for c in self.coolify.calls if c["path"].endswith("/envs/bulk") for e in c["json"]["data"]]
+        self.assertFalse([e for e in envs if e["key"].startswith("CODESKYS_")])
 
     def test_suspended_project_is_refused_before_anything_is_built(self):
         slug = self.linked_project()
@@ -238,16 +244,18 @@ class EngineAuthorizationTests(CoolifyCase):
         d = self.deploy(slug)
         self.assertEqual(d["status"], "failed")
         self.assertIn("suspended", d["error"])
-        self.assertFalse(any(c["path"] == "/deploy" for c in self.coolify.calls), "a build was started")
+        self.assertFalse([c for c in self.coolify.calls if c["path"].startswith("/services")],
+                         "nothing was created or started")
 
-    def test_repository_mismatch_fails_with_a_clear_message_and_reference(self):
-        self.app.config["RUNTIME_SECRET_DIR"] = self.secret_dir
+    def test_repository_mismatch_fails_with_a_clear_message(self):
         slug = self.linked_project()
-        self.authz.deploy_status = 403
+        self.assertEqual(self.deploy(slug)["status"], "ready")          # registers repository 424242
+        self.authz.registered_repo_id = 999999                          # re-registered elsewhere since
+        self.coolify.calls.clear()
         d = self.deploy(slug)
         self.assertEqual(d["status"], "failed")
         self.assertIn("registered repository", d["error"])
-        self.assertIn("REQ-TEST00000001", d["error"])
+        self.assertEqual(self.coolify.calls, [], "the live service is not touched")
 
     def test_authz_unavailable_fails_the_build_honestly(self):
         slug = self.linked_project()
@@ -256,18 +264,40 @@ class EngineAuthorizationTests(CoolifyCase):
         self.assertEqual(d["status"], "failed")
         self.assertIn("temporarily unavailable", d["error"])
 
+    def test_an_unlinked_public_project_deploys_without_protected_services(self):
+        self.as_student()
+        with mock.patch("kova.engine.requests.request", side_effect=self.router):
+            d = self.wait(self.create().get_json()["deployment_id"])
+        self.assertEqual(d["status"], "ready", d.get("error"))
+        self.assertTrue(any("protected Codeskys services will refuse it" in line for line in self.logs(d["id"])))
+        self.assertEqual(self.authz.calls, [], "no authorization record is created or used")
+        create = next(c for c in self.coolify.calls if (c["method"], c["path"]) == ("POST", "/services"))["json"]
+        self.assertFalse(create["connect_to_docker_network"])
+
     def test_required_mode_refuses_unlinked_projects(self):
         self.app.config["AUTHZ_REQUIRED"] = True
         self.as_student()
         with mock.patch("kova.engine.requests.request", side_effect=self.router):
             d = self.wait(self.create().get_json()["deployment_id"])
         self.assertEqual(d["status"], "failed")
-        self.assertIn("not linked", d["error"])
+        self.assertIn("Link this project", d["error"])
 
-    def test_failed_build_revokes_and_removes_its_credential(self):
+    def test_failed_build_revokes_and_removes_a_leftover_credential(self):
+        # Coolify builds request no credential; one left on the row (older code) is still revoked.
         self.app.config["RUNTIME_SECRET_DIR"] = self.secret_dir
         slug = self.linked_project()
-        self.coolify.deploy_status = "failed"
+        self.coolify.app_statuses = ["starting:unhealthy", "exited"]
+        real = self.coolify._route
+        conn = self.app_conn()
+
+        def route(method, path, body):
+            if path.endswith("/start"):
+                conn.execute("UPDATE deployments SET authz_deployment_id = 'dep_abcdef0123456789' "
+                             "WHERE id = (SELECT MAX(id) FROM deployments)")
+                conn.commit()
+                runtime_secrets.deliver(self.app.config, "dep_abcdef0123456789", RUNTIME_SECRET)
+            return real(method, path, body)
+        self.coolify._route = route
         d = self.deploy(slug)
         self.assertEqual(d["status"], "failed")
         self.assertEqual(self.authz.revoked, ["dep_abcdef0123456789"])
@@ -285,6 +315,9 @@ class EngineAuthorizationTests(CoolifyCase):
         self.app.config["RUNTIME_SECRET_DIR"] = self.secret_dir
         slug = self.linked_project()
         self.deploy(slug)
+        conn = self.app_conn()                     # a credential left by older code
+        conn.execute("UPDATE deployments SET authz_deployment_id = 'dep_abcdef0123456789'")
+        conn.commit()
         self.authz.down = True
         with mock.patch("kova.engine.requests.request", side_effect=self.router):
             r = self.client.delete(f"/api/projects/{slug}", json={"confirm": slug},
@@ -390,36 +423,12 @@ class OwnerLinkTests(EngineAuthorizationTests.__base__):
 
 
 class AppControlTests(CoolifyCase):
+    # Coolify-backed start/stop/restart: test_coolify.AppControlTests.
     def test_simulated_projects_cannot_be_started_or_stopped(self):
         self.as_student()
         slug = self.create(deploy=False).get_json()["project"]["slug"]
         self.assertEqual(self.call("post", f"/api/projects/{slug}/app/stop").status_code, 409)
         self.assertEqual(self.call("post", f"/api/projects/{slug}/app/explode").status_code, 404)
-
-    def test_stop_start_restart_reach_coolify_with_get_fallback(self):
-        self.configure_coolify()
-        self.as_student()
-        fake = FakeCoolify()
-        with mock.patch("kova.engine.requests.request", side_effect=fake):
-            self.wait(self.create().get_json()["deployment_id"])
-        slug = "web-app"
-
-        def old_coolify(method, url, **kw):
-            path = url.split("/api/v1", 1)[1]
-            if path.endswith(("/start", "/restart")) and method == "POST":
-                fake.calls.append({"method": method, "path": path})
-                return _Resp({"message": "Method Not Allowed"}, 405)
-            return fake(method, url, **kw)
-
-        with mock.patch("kova.engine.requests.request", side_effect=old_coolify):
-            for action in ("stop", "start", "restart"):
-                r = self.call("post", f"/api/projects/{slug}/app/{action}")
-                self.assertEqual(r.status_code, 200, r.get_json())
-            status = self.client.get(f"/api/projects/{slug}/app")
-        self.assertEqual(status.status_code, 200)
-        restarts = [c["method"] for c in fake.calls if c["path"].endswith("/restart")]
-        self.assertEqual(restarts, ["POST", "GET"])
-
 
 class RuntimeSecretSinkTests(CoolifyCase):
     def test_refuses_unexpected_ids_and_traversal(self):
@@ -435,47 +444,35 @@ class RuntimeSecretSinkTests(CoolifyCase):
         self.assertFalse(os.path.exists(os.path.dirname(p)))
         self.assertFalse(runtime_secrets.discard(cfg, "dep_abcdef012345"))
 
+    def test_refuses_platform_secret_groups(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        for gid in ("1998", "1999"):
+            with self.subTest(gid=gid), self.assertRaises(runtime_secrets.SinkError):
+                runtime_secrets.deliver({"RUNTIME_SECRET_DIR": d, "RUNTIME_SECRET_GID": gid},
+                                        "dep_abcdef012345", "s3cret")
+        self.assertEqual(os.listdir(d), [], "nothing is written with a reserved group")
+
 
 class CoolifyHardeningTests(CoolifyCase):
     def run_one(self, **project):
         self.as_student()
         fake = FakeCoolify()
-
-        def with_github_app(method, url, **kw):
-            if url.split("/api/v1", 1)[1].split("?")[0] == "/applications/private-github-app":
-                fake.calls.append({"method": method, "path": "/applications/private-github-app",
-                                   "json": kw.get("json")})
-                return _Resp({"uuid": "app-123"}, 201)
-            return fake(method, url, **kw)
-
-        with mock.patch("kova.engine.requests.request", side_effect=with_github_app):
+        with mock.patch("kova.engine.requests.request", side_effect=fake):
             d = self.wait(self.create(**project).get_json()["deployment_id"])
         return d, fake
 
     def test_apps_go_to_the_dedicated_destination_network(self):
         self.configure_coolify(coolify_destination_uuid="dst-students")
         d, fake = self.run_one()
-        create = next(c for c in fake.calls if c["path"] == "/applications/public")["json"]
+        create = next(c for c in fake.calls if (c["method"], c["path"]) == ("POST", "/services"))["json"]
         self.assertEqual(create["destination_uuid"], "dst-students")
-
-    def test_private_repos_use_the_read_only_github_app_source(self):
-        self.configure_coolify(coolify_github_app_uuid="gh-app-1")
-        from kova.db import connect
-        conn = connect(self.app.config["DATABASE"])
-        conn.execute("INSERT INTO git_accounts (user_id, provider, external_id, username, token_cipher, created_at, updated_at) "
-                     "VALUES (?, 'github', '1', 'sam', 'x', '2026-01-01', '2026-01-01')", (self.student_id,))
-        conn.commit()
-        conn.close()
-        d, fake = self.run_one(is_private=True)
-        self.assertEqual(d["status"], "ready", d)
-        create = next(c for c in fake.calls if c["path"] == "/applications/private-github-app")["json"]
-        self.assertEqual(create["github_app_uuid"], "gh-app-1")
-        self.assertEqual(create["git_repository"], "acme/web-app")
-        self.assertNotIn("private_key_uuid", create)
+        self.assertIs(create["connect_to_docker_network"], False, "never joined to the destination network")
 
     def test_http_only_mode_until_https_exists(self):
         self.configure_coolify(coolify_force_https="0")
         d, fake = self.run_one()
-        create = next(c for c in fake.calls if c["path"] == "/applications/public")["json"]
-        self.assertFalse(create["is_force_https_enabled"])
-        self.assertTrue(create["domains"].startswith("http://web-app."))
+        self.assertEqual(d["status"], "ready", d)
+        create = next(c for c in fake.calls if (c["method"], c["path"]) == ("POST", "/services"))["json"]
+        self.assertEqual(create["urls"], [{"name": "app", "url": "http://web-app.apps.example.com:3000"}])
+        self.assertEqual(d["url"], "http://web-app.apps.example.com")
