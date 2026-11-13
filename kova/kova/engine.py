@@ -789,8 +789,12 @@ def coolify_refusal(app_config, project) -> str:
     Only one build path exists: a Coolify service made from a compose file Codeskys
     generates (buildpolicy has why). Coolify's build packs run
     ``docker build --network host`` and are never used.
+
+    A project need not be linked to Codeskys authorization: an unlinked app runs
+    isolated with no access to protected Codeskys services (authorize_deployment
+    logs that). ``CODESKYS_AUTHZ_REQUIRED=1`` makes the link mandatory again.
     """
-    if not _col(project, "authz_project_id", ""):
+    if app_config.get("AUTHZ_REQUIRED") and not _col(project, "authz_project_id", ""):
         return "Link this project to your Codeskys authorization before deploying (Project → Settings)."
     if project["is_private"]:
         return ("Private repositories cannot be deployed yet (the build needs a "

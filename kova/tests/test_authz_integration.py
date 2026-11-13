@@ -264,6 +264,16 @@ class EngineAuthorizationTests(CoolifyCase):
         self.assertEqual(d["status"], "failed")
         self.assertIn("temporarily unavailable", d["error"])
 
+    def test_an_unlinked_public_project_deploys_without_protected_services(self):
+        self.as_student()
+        with mock.patch("kova.engine.requests.request", side_effect=self.router):
+            d = self.wait(self.create().get_json()["deployment_id"])
+        self.assertEqual(d["status"], "ready", d.get("error"))
+        self.assertTrue(any("protected Codeskys services will refuse it" in line for line in self.logs(d["id"])))
+        self.assertEqual(self.authz.calls, [], "no authorization record is created or used")
+        create = next(c for c in self.coolify.calls if (c["method"], c["path"]) == ("POST", "/services"))["json"]
+        self.assertFalse(create["connect_to_docker_network"])
+
     def test_required_mode_refuses_unlinked_projects(self):
         self.app.config["AUTHZ_REQUIRED"] = True
         self.as_student()
