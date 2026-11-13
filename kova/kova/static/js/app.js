@@ -236,10 +236,15 @@
     const foot = el("div", "side-foot");
     const prov = State.status && State.status.provider === "coolify";
     foot.append(el("div", "provider-pill", svg(prov ? "shield" : "bolt", "sm") +
-      "<span>Engine: <b style='color:var(--ink)'>" + (prov ? "Coolify" : "Simulator") + "</b></span>"));
+      "<span>Engine: <b style='color:var(--ink)'>" + engineLabel(prov ? "coolify" : "simulator") + "</b></span>"));
     s.append(foot);
   }
   function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
+  // Students never see the backend product name; administrators do.
+  function engineLabel(provider) {
+    if (provider !== "coolify") return cap(provider || "simulator");
+    return State.user && State.user.role === "admin" ? "Coolify" : "Codeskys";
+  }
   function setNav(id) { currentNav = id; buildSidebar(); }
 
   // ---------------------------------------------------------------- top bar wiring
@@ -1346,9 +1351,9 @@
 
   K.route("projects/:slug/compute", (a) => projectShell(a.slug, "compute", async (p, body) => {
     const status = await Api.get("/api/platform/status");
-    const card = moduleHeader("Cloud compute", "Runtime configuration and resource ceilings applied to this project's Coolify application.", status.provider === "coolify" ? "Available" : "Needs provider", "");
+    const card = moduleHeader("Cloud compute", "Runtime configuration and resource ceilings applied to this project's application.", status.provider === "coolify" ? "Available" : "Needs provider", "");
     const pad = el("div", "card-pad stack");
-    pad.append(kv("Deployment engine", cap(status.provider || "simulator")), kv("Provider status", status.coolify && status.coolify.configured ? status.coolify.state : "Coolify not configured"),
+    pad.append(kv("Deployment engine", engineLabel(status.provider)), kv("Provider status", status.engine && status.engine.configured ? status.engine.state : "Not configured"),
       kv("Memory limit", esc(p.limits_memory || "512M")), kv("CPU limit", esc(p.limits_cpus || "0.5")), kv("Application port", String(p.port || 3000)),
       kv("Runtime", esc(p.node_version || "Provider default")));
     if (State.user.role === "admin") {
@@ -1407,7 +1412,7 @@
     featureUnavailable(body, "Data & storage", "Manage object storage and persistent volumes for this project.", "An object storage or volume provider, storage credentials, lifecycle policies, access controls and backup configuration.");
   }));
   K.route("projects/:slug/functions", (a) => projectShell(a.slug, "functions", async (_p, body) => {
-    featureUnavailable(body, "Functions", "Deploy request handlers, scheduled jobs and background functions.", "A sandboxed function runtime and lifecycle controller. The current Coolify container deployment must not be mislabeled as serverless functions.");
+    featureUnavailable(body, "Functions", "Deploy request handlers, scheduled jobs and background functions.", "A sandboxed function runtime and lifecycle controller. The current container deployment must not be mislabeled as serverless functions.");
   }));
   K.route("projects/:slug/edge", (a) => projectShell(a.slug, "edge", async (_p, body) => {
     featureUnavailable(body, "Edge network", "Configure CDN caching and global content delivery.", "A CDN/edge provider, domain delegation, cache invalidation integration and edge analytics.");
@@ -2449,11 +2454,11 @@
       { id:"agents", icon:"⚙", title:"Agent runners", desc:"Queue, execute and recover deployment build jobs with worker leases, retries and build logs.", state:"Available", cls:"ready", action:"#/deployments", label:"View build activity", detail:"Codeskys's durable job worker runs deployment jobs and retries recoverable failures. It is not a general-purpose AI agent runner." },
       { id:"previews", icon:"◫", title:"Deploy previews", desc:"Create preview deployments alongside production and inspect their build status and logs.", state:"Available", cls:"ready", action:"#/projects", label:"Open projects", detail:"Preview deployments are supported by the existing project deployment workflow. Each preview is a separate deployment target." },
       { id:"ai", icon:"✧", title:"AI gateway", desc:"A central gateway for routing and observing AI model requests from your applications.", state:"Provider required", cls:"setup", action:"", label:"View requirements", detail:"Not implemented yet. A real AI gateway needs provider credentials, secure proxying, usage metering, model routing and rate limits. No AI requests are routed by Codeskys today." },
-      { id:"functions", icon:"λ", title:"Functions", desc:"Run backend application code as managed functions with logs and deployment lifecycle.", state:"Runtime required", cls:"setup", action:"", label:"View requirements", detail:"Codeskys can deploy supported full-stack applications through Coolify, but it does not currently provide a separate serverless-functions runtime or function invocation API." },
+      { id:"functions", icon:"λ", title:"Functions", desc:"Run backend application code as managed functions with logs and deployment lifecycle.", state:"Runtime required", cls:"setup", action:"", label:"View requirements", detail:"Codeskys can deploy supported full-stack applications through its deployment engine, but it does not currently provide a separate serverless-functions runtime or function invocation API." },
       { id:"database", icon:"▤", title:"Database", desc:"Connect application databases and manage credentials without exposing secrets.", state:"Database provider required", cls:"setup", action:"#/integrations", label:"Open integrations", detail:"Codeskys's own metadata database is SQLite. Per-project managed PostgreSQL or other database provisioning is not implemented. This needs a database provider and isolated credentials." },
       { id:"observability", icon:"⌁", title:"Observability", desc:"Track deployment volume, success rate, build performance, activity and logs.", state:"Available", cls:"ready", action:"#/analytics", label:"Open analytics", detail:"Codeskys provides deployment analytics, build duration metrics, activity history and per-deployment build logs. Application-level traces and live infrastructure metrics are not yet included." },
       { id:"security", icon:"◇", title:"Security", desc:"Account protection, access control, encrypted provider tokens, CSRF and rate limits.", state:"Available", cls:"ready", action:"#/settings?tab=security", label:"Open security settings", detail:"Codeskys includes password hashing, session protection, CSRF checks, role-based authorization, rate limiting and encrypted Git provider tokens. Environment-variable encryption and independent security review remain outstanding." },
-      { id:"edge", icon:"◎", title:"Edge network", desc:"Serve applications through a distributed CDN with edge caching and routing.", state:"CDN required", cls:"setup", action:"#/integrations", label:"View integrations", detail:"Codeskys currently deploys through the configured Coolify server. It does not operate a global edge network. A CDN or edge provider and DNS configuration are required." }
+      { id:"edge", icon:"◎", title:"Edge network", desc:"Serve applications through a distributed CDN with edge caching and routing.", state:"CDN required", cls:"setup", action:"#/integrations", label:"View integrations", detail:"Codeskys currently deploys through its configured deployment server. It does not operate a global edge network. A CDN or edge provider and DNS configuration are required." }
     ];
     const grid = el("div", "kova-feature-grid");
     items.forEach((it) => {
@@ -2471,7 +2476,7 @@
       foot.append(action); card.append(foot); grid.append(card);
     });
     const note = el("div", "callout warn");
-    note.innerHTML = svg("info") + "<div><b>Live deployment requirement:</b> Real builds and public URLs require a reachable Coolify server, a VPS, domain/DNS and provider credentials. Until connected, Codeskys's simulator is clearly labelled and does not publish real websites.</div>";
+    note.innerHTML = svg("info") + "<div><b>Live deployment requirement:</b> Real builds and public URLs require a reachable deployment server, a VPS, domain/DNS and provider credentials. Until connected, Codeskys's simulator is clearly labelled and does not publish real websites.</div>";
     setView(view(head, intro, grid, note));
   });
 

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+{% if state == "expired" %}<title>Deployment expired · {{ project.name }}</title>{% elif project %}<title>Not available · {{ project.name }}</title>{% else %}<title>No app here · Codeskys</title>{% endif %}
+<style>{{ css }}</style></head>
+<body><main>
+{% if state == "expired" %}
+<div class="badge warn"><span class="dot"></span> Deployment expired</div><h1>{{ project.name }}</h1>
+<p class="lead">This deployment was available for {{ project.ttl_hours or 24 }} hours and has now expired. The owner can deploy it again from Codeskys.</p>
+{% elif project %}
+<div class="badge warn"><span class="dot"></span> No live deployment</div><h1>{{ project.name }}</h1>
+<p class="lead">This project doesn't have a live deployment right now. Check the build logs in Codeskys.</p>
+{% else %}
+<div class="badge warn"><span class="dot"></span> No app here</div><h1>Nothing deployed at this address</h1>
+<p class="lead">There is no Codeskys app at this address.</p>
+{% endif %}
+</main>
+<footer>Hosted by <a href="{{ home }}"><strong>Codeskys</strong></a></footer></body></html>

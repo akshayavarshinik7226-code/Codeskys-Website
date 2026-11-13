@@ -13,7 +13,7 @@ a restart. Two providers implement the same contract:
     deployment: rows carry ``provider='simulator'`` and the UI badges them.
 
 ``coolify``
-    Creates and drives a real application on a Coolify server over its v1 API.
+    Creates and drives a real Coolify *service* (one per project) over its v1 API.
 
 Cancellation crosses process boundaries through the database: the API sets
 ``stage='cancelling'`` and the worker notices on its next checkpoint.
@@ -23,12 +23,14 @@ import random
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import requests
 
-from . import authz_client, runtime_secrets
+from . import authz_client, buildpolicy, runtime_secrets
 from .db import get_setting, utcnow
 from .crypto import Secrets
+from .security import redact
 from .gitinfo import FRAMEWORKS, latest_commit
 from .jobs import enqueue, handler
 
@@ -37,7 +39,15 @@ COOLIFY = "coolify"
 
 
 class CoolifyError(RuntimeError):
-    """A Coolify call failed. Always surfaced to the user verbatim — never swallowed."""
+    """A Coolify call failed. Always surfaced to the user — never swallowed.
+
+    ``str(exc)`` is safe for students; ``detail`` keeps the unredacted upstream text
+    for administrators.
+    """
+
+    def __init__(self, message: str, detail: str = ""):
+        super().__init__(message)
+        self.detail = detail or message
 
 
 class Cancelled(Exception):
@@ -61,7 +71,29 @@ def coolify_settings(conn, app_config) -> dict:
         # network with Coolify's own database, Redis or API.
         "destination_uuid": app_config.get("COOLIFY_DESTINATION_UUID") or get_setting(conn, "coolify_destination_uuid", "") or "",
         "force_https": _force_https(conn, app_config),
+        "tls_at_edge": bool(app_config.get("COOLIFY_TLS_AT_EDGE")) or get_setting(conn, "coolify_tls_at_edge", "") == "1",
+        # Readiness check after a build: how long to wait, and where to send the HTTP
+        # probe from inside the server (Traefik), instead of the public URL.
+        "ready_timeout": int(app_config.get("COOLIFY_READY_TIMEOUT") or 180),
+        "probe_url": (app_config.get("COOLIFY_PROBE_URL") or "").rstrip("/"),
     }
+
+
+def app_domains(slug: str, settings) -> tuple:
+    """(domain given to Coolify, public URL shown to the student), or (None, None).
+
+    With TLS at the edge, Caddy holds the certificate and forwards plain HTTP to
+    Traefik: Coolify must get an http:// domain (an https:// one makes Traefik
+    request its own certificate and redirect to HTTPS, which loops behind Caddy).
+    """
+    base = (settings.get("base_domain") or "").strip().lower().strip(".")
+    if not base:
+        return None, None
+    host = f"{slug}.{base}"
+    if settings.get("tls_at_edge"):
+        return f"http://{host}", f"https://{host}"
+    scheme = "https" if settings.get("force_https", True) else "http"
+    return f"{scheme}://{host}", f"{scheme}://{host}"
 
 
 def _force_https(conn, app_config) -> bool:
@@ -101,18 +133,20 @@ class Coolify:
         try:
             r = requests.request(method, self.base + path, headers=self.headers, timeout=self.timeout, **kw)
         except requests.RequestException as exc:
-            raise CoolifyError(f"Could not reach Coolify at {self.base}: {exc.__class__.__name__}") from exc
+            raise CoolifyError(f"Could not reach the deployment engine: {exc.__class__.__name__}",
+                               f"Could not reach Coolify at {self.base}: {exc}") from exc
         if r.status_code == 401:
-            raise CoolifyError("Coolify rejected the API token (401). Check the token and its permissions.")
+            raise CoolifyError("The deployment engine rejected the API token (401). Check the token and its permissions.")
         if r.status_code == 403:
-            raise CoolifyError("Coolify denied this action (403). The token is missing a required permission.")
+            raise CoolifyError("The deployment engine denied this action (403). The token is missing a required permission.")
         if r.status_code >= 400:
             try:
                 body = r.json()
                 msg = body.get("message") or body.get("error") or json.dumps(body)[:300]
             except ValueError:
                 msg = r.text[:300]
-            raise CoolifyError(f"Coolify returned {r.status_code}: {msg}")
+            raise CoolifyError(f"The deployment engine returned {r.status_code}: {redact(msg)}",
+                               f"Coolify returned {r.status_code}: {msg}")
         try:
             return r.json()
         except ValueError:
@@ -131,85 +165,75 @@ class Coolify:
     def private_keys(self):
         return self._req("GET", "/security/keys")
 
-    # -- applications
-    def create_public_app(self, body: dict) -> str:
-        return self._req("POST", "/applications/public", json=body)["uuid"]
+    # -- the project's app = one Coolify *service* (Services API, Coolify 4.7.5)
+    #
+    # 4.7.5 has no endpoint that creates an *application* from a raw compose file, and
+    # its git/Dockerfile application build packs build with --network host. A service
+    # made from docker_compose_raw is started with `docker compose up -d --build` on
+    # exactly that file, which keeps the build isolation of the generated compose.
+    # Paths, fields and abilities checked against openapi.yaml, routes/api.php and
+    # ServicesController.php at the v4.7.5 tag (COOLIFY_SINGLE_VPS_PLAN.md §14).
+    # Start, stop, restart and delete only queue work and return a message: progress
+    # is read from the service's ``status`` ("starting:…" while the build runs).
 
-    def create_private_app(self, body: dict) -> str:
-        return self._req("POST", "/applications/private-deploy-key", json=body)["uuid"]
+    def services(self):
+        return self._req("GET", "/services")
 
-    def create_compose_app(self, body: dict) -> str:
-        """Docker Compose application from raw compose (base64, per the v4 API).
-        UNVERIFIED against a live Coolify: check the field names after install."""
-        return self._req("POST", "/applications/dockercompose", json=body)["uuid"]
+    def create_service(self, body: dict) -> str:
+        return self._req("POST", "/services", json=body)["uuid"]
 
-    def create_github_app_app(self, body: dict) -> str:
-        """Private repository through a Coolify "GitHub App" source (read-only App)."""
-        return self._req("POST", "/applications/private-github-app", json=body)["uuid"]
+    def update_service(self, uuid: str, body: dict):
+        return self._req("PATCH", f"/services/{uuid}", json=body)
 
     def get_app(self, uuid: str):
-        return self._req("GET", f"/applications/{uuid}")
-
-    def update_app(self, uuid: str, body: dict):
-        return self._req("PATCH", f"/applications/{uuid}", json=body)
+        return self._req("GET", f"/services/{uuid}")
 
     def bulk_envs(self, uuid: str, envs: list):
         if envs:
-            return self._req("PATCH", f"/applications/{uuid}/envs/bulk", json={"data": envs})
+            return self._req("PATCH", f"/services/{uuid}/envs/bulk", json={"data": envs})
 
     def app_logs(self, uuid: str, lines: int = 200):
-        return self._req("GET", f"/applications/{uuid}/logs", params={"lines": lines})
-
-    def _lifecycle(self, uuid: str, action: str, params=None):
-        """start / stop / restart. Coolify v4 serves these as GET; newer builds also
-        accept POST. Try POST first and fall back on 405, like ``deploy``."""
-        try:
-            return self._req("POST", f"/applications/{uuid}/{action}", params=params)
-        except CoolifyError as exc:
-            if "405" not in str(exc):
-                raise
-            return self._req("GET", f"/applications/{uuid}/{action}", params=params)
+        """Output of the ``app`` container. Needs the read:sensitive ability, which the
+        Codeskys token does not have: callers treat a refusal as "no logs"."""
+        return self._req("GET", f"/services/{uuid}/logs", params={"sub_service_name": "app", "lines": lines})
 
     def stop_app(self, uuid: str):
-        return self._lifecycle(uuid, "stop", {"docker_cleanup": "true"})
+        try:
+            return self._req("POST", f"/services/{uuid}/stop", params={"docker_cleanup": "true"})
+        except CoolifyError as exc:
+            if "already stopped" in str(exc).lower():
+                return {"message": "already stopped"}
+            raise
 
     def start_app(self, uuid: str):
-        return self._lifecycle(uuid, "start")
+        """Builds and starts. Coolify refuses (400) a service that is already running."""
+        return self._req("POST", f"/services/{uuid}/start")
 
     def restart_app(self, uuid: str):
-        return self._lifecycle(uuid, "restart")
+        """Stops, then builds and starts again with the stored compose file."""
+        return self._req("POST", f"/services/{uuid}/restart")
+
+    def run_app(self, uuid: str):
+        """Build and start the stored compose file: start, or restart when it is running."""
+        try:
+            return self.start_app(uuid)
+        except CoolifyError as exc:
+            if "already running" not in str(exc).lower():
+                raise
+        return self.restart_app(uuid)
 
     def delete_app(self, uuid: str):
-        return self._req("DELETE", f"/applications/{uuid}", params={
+        # delete_connected_networks removes only the service's own network (named after
+        # its uuid), never the external codeskys-* networks the compose file joins.
+        return self._req("DELETE", f"/services/{uuid}", params={
             "delete_configurations": "true", "delete_volumes": "true",
-            "docker_cleanup": "true", "delete_connected_networks": "false"})
-
-    # -- deployments
-    def deploy(self, uuid: str, force=False) -> str:
-        """Trigger a build. Current Coolify exposes POST /deploy; older builds used GET."""
-        params = {"uuid": uuid, "force": "true" if force else "false"}
-        try:
-            data = self._req("POST", "/deploy", params=params)
-        except CoolifyError as exc:
-            if "405" not in str(exc):
-                raise
-            data = self._req("GET", "/deploy", params=params)
-        deployments = data.get("deployments") or []
-        if not deployments:
-            raise CoolifyError(data.get("message") or "Coolify accepted the request but started no deployment.")
-        return deployments[0]["deployment_uuid"]
-
-    def deployment(self, dep_uuid: str):
-        return self._req("GET", f"/deployments/{dep_uuid}")
-
-    def cancel_deployment(self, dep_uuid: str):
-        return self._req("POST", f"/deployments/{dep_uuid}/cancel")
+            "docker_cleanup": "true", "delete_connected_networks": "true"})
 
 
 def client_for(conn, app_config):
     s = coolify_settings(conn, app_config)
     if not (s["url"] and s["token"]):
-        raise CoolifyError("Coolify is not configured. Add the instance URL and API token in Integrations.")
+        raise CoolifyError("The deployment engine is not configured. An administrator must connect it in Integrations.")
     return Coolify(s["url"], s["token"]), s
 
 
@@ -306,9 +330,9 @@ def _col(row, name, default=None):
     return row[name] if name in row.keys() else default
 
 
-def authorize_deployment(conn, app_config, dep, project):
-    """Verify the repository with authz and, when a runtime-secret sink exists,
-    obtain a deployment-bound credential for this REAL build.
+def authorize_deployment(conn, app_config, dep, project, with_credential=True):
+    """Verify the repository with authz and, when a runtime-secret sink exists and
+    ``with_credential``, obtain a deployment-bound credential for this REAL build.
 
     Returns NON-SECRET Coolify env entries (possibly empty). Raises
     :class:`AuthorizationRefused` with a student-facing message when the build
@@ -339,6 +363,17 @@ def authorize_deployment(conn, app_config, dep, project):
             conn.commit()
             _log(conn, dep["id"], f"Repository verified with GitHub: {reg.get('full_name')} (id {repo_id}, "
                                   f"{reg.get('verified_by')})", "success", "provisioning")
+        if not with_credential:
+            # authz checks the repository when it issues a credential; without one the
+            # same rule is applied to the registered id in the project object.
+            registered = (state.get("repository") or {}).get("github_repo_id")
+            if project["github_repo_id"] and registered is not None and int(registered) != int(repo_id):
+                raise authz_client.AuthzError(403, authz_client.REPO)
+            _log(conn, dep["id"], "Repository authorized. Protected Codeskys services are not available to "
+                                  "live deployments yet (the engine cannot keep a runtime sidecar's network "
+                                  "away from the app), so no deployment credential was requested.",
+                 "warn", "provisioning")
+            return []
         if not runtime_secrets.enabled(app_config):
             _log(conn, dep["id"], "Repository authorized. Protected Codeskys services are not wired to this "
                                   "engine yet (no runtime-proxy sidecar), so no deployment credential was "
@@ -381,20 +416,50 @@ def authorize_deployment(conn, app_config, dep, project):
     return env
 
 
-def revoke_authz_deployment(conn, app_config, dep, reason: str) -> str:
-    """Revoke a deployment's credential. Idempotent; never raises."""
-    dep_ref = _col(dep, "authz_deployment_id", "")
-    if not dep_ref or _col(dep, "authz_revoked_at"):
-        return ""
+# A revocation that fails (authz unreachable) is retried by a durable job: every
+# 5 minutes for ~25 hours, longer than authz's own backstop TTL
+# (AUTHZ_DEPLOYMENT_TTL_DAYS=1), after which the credential is dead anyway.
+REVOKE_RETRY_ATTEMPTS = 300
+
+
+def schedule_revoke_retry(conn, dep_ref: str, deployment_id, reason: str):
+    """Queue a durable revocation retry. Survives restarts and project deletion
+    (the job carries the credential id itself, not just the deployment row)."""
+    return enqueue(conn, "authz_revoke",
+                   {"authz_deployment_id": dep_ref, "deployment_id": deployment_id, "reason": reason[:200]},
+                   dedupe_key=f"authz-revoke:{dep_ref}", delay=15, max_attempts=REVOKE_RETRY_ATTEMPTS)
+
+
+def _revoke_remote(app_config, dep_ref: str, reason: str):
+    """Revoke at authz. Raises RuntimeError when authz did not confirm it."""
     client = authz_client.client_from_config(app_config)
     if client is None:
-        return f"Authorization credential {dep_ref} could not be revoked: authz is not configured."
+        raise RuntimeError("authz is not configured")
     try:
         client.revoke_deployment(dep_ref, reason)
     except authz_client.AuthzError as exc:
-        if exc.status != 404:
-            return f"Authorization credential {dep_ref} could not be revoked ({exc.describe()}); retry later."
+        if exc.status != 404:                  # 404 = already gone: nothing left to revoke
+            raise RuntimeError(exc.describe()) from None
+
+
+def revoke_authz_deployment(conn, app_config, dep, reason: str) -> str:
+    """Revoke a deployment's credential. Idempotent; never raises.
+
+    Local kill switch first: the sidecar's secret file is zeroed in place and
+    removed, so this server stops using the credential at once, whether or not
+    authz can be reached right now. Then authz is told; if that fails, a durable
+    retry is queued.
+    """
+    dep_ref = _col(dep, "authz_deployment_id", "")
+    if not dep_ref or _col(dep, "authz_revoked_at"):
+        return ""
     runtime_secrets.discard(app_config, dep_ref)
+    try:
+        _revoke_remote(app_config, dep_ref, reason)
+    except RuntimeError as exc:
+        schedule_revoke_retry(conn, dep_ref, dep["id"], reason)
+        return (f"Authorization credential {dep_ref} could not be revoked ({exc}); its secret file was "
+                "destroyed and the revocation will be retried automatically.")
     conn.execute("UPDATE deployments SET authz_revoked_at = ? WHERE id = ?", (utcnow(), dep["id"]))
     conn.commit()
     return f"Authorization credential {dep_ref} revoked."
@@ -457,9 +522,10 @@ def run_deployment(conn, app_config, payload, beat):
 def expire_deployment(conn, app_config, payload, beat):
     """TTL reached: tear the deployment down and mark it expired.
 
-    The Coolify application is only removed when this deployment is the one it is
-    currently serving. Codeskys deletes **only** applications it created itself — the
-    guard is that it must match both the uuid Codeskys stored and the name Codeskys gave it.
+    The Coolify service is only removed when this deployment is the one it is
+    currently serving. Codeskys deletes **only** services it created itself — the
+    guard is that it must match the uuid Codeskys stored, the name Codeskys gave it and
+    the ownership marker in its description.
     """
     dep_id = payload["deployment_id"]
     dep = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
@@ -470,11 +536,19 @@ def expire_deployment(conn, app_config, payload, beat):
         return
     note = "Deployment expired."
     is_live = project["current_deployment_id"] == dep["id"]
+    # Credential first: even if removing the app fails below, it can no longer
+    # reach protected Codeskys services.
+    revoked = revoke_authz_deployment(conn, app_config, dep, "deployment expired")
     if is_live and dep["provider"] == COOLIFY and project["provider_ref"]:
         note = teardown_coolify_app(conn, app_config, project)
+        still = conn.execute("SELECT provider_ref FROM projects WHERE id = ?", (project["id"],)).fetchone()
+        if still and still["provider_ref"] and "Refused" not in note:
+            # Coolify could not be reached / refused the delete: the app may still be
+            # serving. Retry until it is gone (the 24 h limit must actually end it).
+            schedule_teardown_retry(conn, project["id"], still["provider_ref"])
+            note = f"{note} Removal will be retried automatically."
     elif dep["provider"] == SIMULATOR:
         note = "Simulated deployment expired; it no longer serves."
-    revoked = revoke_authz_deployment(conn, app_config, dep, "deployment expired")
     if revoked:
         note = f"{note} {revoked}"
     conn.execute("UPDATE deployments SET status='expired', stage='expired', expired_at=?, teardown_note=? "
@@ -493,28 +567,26 @@ def expire_deployment(conn, app_config, payload, beat):
 
 
 def teardown_coolify_app(conn, app_config, project) -> str:
-    """Stop and delete the Coolify application Codeskys created for this project."""
+    """Stop and delete the Coolify service Codeskys created for this project. Never raises."""
     uuid = project["provider_ref"]
     if not uuid:
-        return "No Coolify application was attached to this project."
+        return "No live application was attached to this project."
     try:
         api, _ = client_for(conn, app_config)
     except CoolifyError as exc:
-        return f"Expired, but Coolify could not be reached to remove the application: {exc}"
+        return f"Expired, but the deployment engine could not be reached to remove the application: {exc}"
     # Guard: only ever touch an application Codeskys itself created and named.
-    expected = project["coolify_app_name"] or project["slug"]
     try:
         remote = api.get_app(uuid)
     except CoolifyError as exc:
         if "404" in str(exc):
             conn.execute("UPDATE projects SET provider_ref = NULL WHERE id = ?", (project["id"],))
             conn.commit()
-            return "Coolify application was already gone."
-        return f"Expired, but the Coolify application could not be inspected: {exc}"
-    remote_name = (remote.get("name") or "")
-    if remote_name and expected and remote_name != expected:
-        return (f"Expired. Refused to delete Coolify application {uuid}: its name "
-                f"'{remote_name}' does not match the one Codeskys created ('{expected}').")
+            return "The application was already gone."
+        return f"Expired, but the application could not be inspected: {exc}"
+    problem = ownership_problem(remote, project)
+    if problem:
+        return f"Expired. Refused to delete application {uuid}: {problem}."
     try:
         api.stop_app(uuid)
     except CoolifyError:
@@ -522,10 +594,120 @@ def teardown_coolify_app(conn, app_config, project) -> str:
     try:
         api.delete_app(uuid)
     except CoolifyError as exc:
-        return f"Expired and stopped, but deleting the Coolify application failed: {exc}"
+        return f"Expired and stopped, but deleting the application failed: {exc}"
     conn.execute("UPDATE projects SET provider_ref = NULL, coolify_app_name = '' WHERE id = ?", (project["id"],))
     conn.commit()
-    return f"Expired. Coolify application {uuid} was stopped and deleted."
+    return f"Expired. Application {uuid} was stopped and deleted."
+
+
+# ---------------------------------------------------------------- durable retries
+
+TEARDOWN_RETRY_ATTEMPTS = 300      # every 5 min for ~25 h per job
+
+
+def schedule_teardown_retry(conn, project_id: int, app_ref: str):
+    # Dedupe keys are unique forever, so the key carries the UTC day: if a job
+    # exhausts its attempts, the sweep can still queue a new one the next day.
+    # (Two overlapping jobs are harmless: the handler re-checks and is idempotent.)
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return enqueue(conn, "coolify_teardown", {"project_id": project_id, "app_ref": app_ref},
+                   dedupe_key=f"coolify-teardown:{project_id}:{app_ref}:{day}", delay=15,
+                   max_attempts=TEARDOWN_RETRY_ATTEMPTS)
+
+
+def teardown_pending(conn, project_id: int, app_ref: str | None = None) -> bool:
+    """True while an expired project's Coolify app still exists and nothing new is
+    deploying or live. Re-checked at run time so a retry never removes an app a
+    newer deployment is using."""
+    p = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if p is None or not p["provider_ref"] or p["current_deployment_id"] is not None:
+        return False
+    if app_ref is not None and p["provider_ref"] != app_ref:
+        return False
+    latest = conn.execute("SELECT status FROM deployments WHERE project_id = ? ORDER BY id DESC LIMIT 1",
+                          (project_id,)).fetchone()
+    if latest is None or latest["status"] != "expired":
+        return False
+    busy = conn.execute("SELECT 1 FROM deployments WHERE project_id = ? AND status IN ('queued','building')",
+                        (project_id,)).fetchone()
+    return busy is None
+
+
+@handler("coolify_teardown")
+def retry_teardown(conn, app_config, payload, beat):
+    pid, ref = payload["project_id"], payload.get("app_ref")
+    if not teardown_pending(conn, pid, ref):
+        return                                  # already gone, or a newer deployment owns it
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
+    note = teardown_coolify_app(conn, app_config, project)
+    latest = conn.execute("SELECT id FROM deployments WHERE project_id = ? ORDER BY id DESC LIMIT 1",
+                          (pid,)).fetchone()
+    if latest is not None:
+        _log(conn, latest["id"], f"Retry: {note}", "warn", "expired")
+    if "Refused" in note:
+        return                                  # name guard: never retry into a foreign app
+    if conn.execute("SELECT provider_ref FROM projects WHERE id = ?", (pid,)).fetchone()["provider_ref"]:
+        raise RuntimeError(note)                # still there: back off and try again
+
+
+QUIESCE_ATTEMPTS = 20           # with the queue's backoff: about 1.5 hours
+QUIESCE_WINDOW = 60 * 50        # longer than a build may run on Coolify (45 min)
+
+
+def schedule_quiesce(conn, project_id: int, app_ref: str, deployment_id: int):
+    """Keep a cancelled build stopped. Coolify has no cancel for a service start: its
+    stop marks the start cancelled, but a build already running on the server can
+    still finish and start the container afterwards."""
+    return enqueue(conn, "coolify_quiesce",
+                   {"project_id": project_id, "app_ref": app_ref, "deployment_id": deployment_id},
+                   dedupe_key=f"coolify-quiesce:{deployment_id}", delay=30, max_attempts=QUIESCE_ATTEMPTS)
+
+
+@handler("coolify_quiesce")
+def quiesce_cancelled_build(conn, app_config, payload, beat):
+    """Stop the service again whenever it runs, until the build window is over.
+    Raising means "look again later" (the queue's retry backoff)."""
+    pid, ref, dep_id = payload["project_id"], payload["app_ref"], payload["deployment_id"]
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
+    if project is None or project["provider_ref"] != ref:
+        return                                  # deleted, or the project has another service now
+    if conn.execute("SELECT 1 FROM deployments WHERE project_id = ? AND id > ?", (pid, dep_id)).fetchone():
+        return                                  # a newer deployment owns the service
+    api, _ = client_for(conn, app_config)       # CoolifyError -> retried
+    try:
+        remote = api.get_app(ref)
+    except CoolifyError as exc:
+        if "404" in str(exc):
+            return
+        raise
+    if ownership_problem(remote, project):
+        return                                  # never touch a service Codeskys did not create
+    status = str(remote.get("status") or "").lower()
+    if not status.startswith(("exited", "stopped", "unknown")):
+        if conn.execute("SELECT 1 FROM deployments WHERE project_id = ? AND id > ?", (pid, dep_id)).fetchone():
+            return                              # a deploy started while Coolify was asked
+        api.stop_app(ref)
+        _log(conn, dep_id, f"The cancelled build's app was {status or 'running'}; stopped it again.",
+             "warn", "cancelled")
+        raise RuntimeError("stopped again; checking later")
+    dep = conn.execute("SELECT finished_at FROM deployments WHERE id = ?", (dep_id,)).fetchone()
+    if dep is not None and dep["finished_at"] and _ms_since(dep["finished_at"]) < QUIESCE_WINDOW * 1000:
+        raise RuntimeError("stopped; watching until the build window is over")
+
+
+@handler("authz_revoke")
+def retry_revoke(conn, app_config, payload, beat):
+    dep_ref = payload["authz_deployment_id"]
+    dep_id = payload.get("deployment_id")
+    row = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone() if dep_id else None
+    if row is not None and (row["authz_revoked_at"] or row["authz_deployment_id"] != dep_ref):
+        return
+    runtime_secrets.discard(app_config, dep_ref)        # idempotent
+    _revoke_remote(app_config, dep_ref, payload.get("reason") or "revocation retry")   # raises -> retry
+    if row is not None:
+        conn.execute("UPDATE deployments SET authz_revoked_at = ? WHERE id = ?", (utcnow(), row["id"]))
+        conn.commit()
+        _log(conn, row["id"], f"Authorization credential {dep_ref} revoked (retry).", "info", row["status"])
 
 
 # ---------------------------------------------------------------- simulator
@@ -560,7 +742,7 @@ def _run_simulator(conn, app_config, dep, project, beat):
     stage("initializing")
     _log(conn, dep_id, "SIMULATOR — this build is not real. No repository code is fetched, built or run.",
          "warn", "initializing")
-    _log(conn, dep_id, "Connect a Coolify server in Integrations to produce real deployments.", "warn", "initializing")
+    _log(conn, dep_id, "Real deployments start once an administrator connects the deployment engine.", "warn", "initializing")
     pause(0.3, 0.7)
     stage("cloning")
     _log(conn, dep_id, f"Would clone {project['repo_url']} (branch: {dep['branch']})", stage="cloning")
@@ -601,240 +783,390 @@ def _run_simulator(conn, app_config, dep, project, beat):
 
 # ---------------------------------------------------------------- coolify
 
-def _build_pack(project):
-    if project["framework"] == "docker":
-        return "dockerfile"
-    if project["framework"] == "static" and not (project["build_command"] or FRAMEWORKS.get(project["framework"], {}).get("build")):
-        return "static"
-    return "nixpacks"
+def coolify_refusal(app_config, project) -> str:
+    """Why this project cannot be built on Coolify, or "" when it can.
+
+    Only one build path exists: a Coolify service made from a compose file Codeskys
+    generates (buildpolicy has why). Coolify's build packs run
+    ``docker build --network host`` and are never used.
+    """
+    if not _col(project, "authz_project_id", ""):
+        return "Link this project to your Codeskys authorization before deploying (Project → Settings)."
+    if project["is_private"]:
+        return ("Private repositories cannot be deployed yet (the build needs a "
+                "read-only clone path). Deploy a public repository.")
+    if project["framework"] not in FRAMEWORKS:
+        return "Unknown framework. Choose one of the frameworks in Project → Settings."
+    return ""
 
 
-def _ssh_url(repo_url: str) -> str:
-    """Coolify clones private repos over SSH with the deploy key."""
-    u = repo_url.replace("https://", "").replace("http://", "").rstrip("/").removesuffix(".git")
-    host, _, path = u.partition("/")
-    return f"git@{host}:{path}.git"
+def owner_marker(project) -> str:
+    """Description Codeskys gives every Coolify service it creates (checked before any
+    change, stop, start, restart or delete, together with the name). Coolify 4.7.5
+    accepts letters, digits, spaces and - _ . , ! ? ( ) ' " + = * @ / & only."""
+    return f"Managed by Codeskys - project {project['id']} ({project['slug']}). Do not edit."
 
 
-def _app_body(project, dep, settings, domain):
-    fw = FRAMEWORKS.get(project["framework"], FRAMEWORKS["static"])
-    publish = project["output_dir"] or fw["output"]
-    body = {
-        "git_repository": _ssh_url(project["repo_url"]) if project["is_private"] else project["repo_url"],
-        "git_branch": dep["branch"],
-        "build_pack": _build_pack(project),
-        "ports_exposes": str(project["port"]),
-        "install_command": project["install_command"] or fw["install"],
-        "build_command": project["build_command"] or fw["build"],
-        "start_command": project["start_command"] or fw["start"],
-        "base_directory": "/" + project["root_dir"].strip("/") if project["root_dir"] else "/",
-        "publish_directory": "/" + publish.strip("/") if publish else None,
-        "is_static": bool(fw["static"]),
-        "is_auto_deploy_enabled": False,   # Codeskys drives deploys; Coolify must not also trigger them
-        "is_force_https_enabled": bool(settings.get("force_https", True)),
-        # Resource limits keep one student's build from starving the server.
-        "limits_memory": project["limits_memory"] or "512M",
-        "limits_cpus": project["limits_cpus"] or "0.5",
-    }
-    if domain:
-        body["domains"] = domain
-    return {k: v for k, v in body.items() if v not in (None, "")}
+def ownership_problem(remote: dict, project) -> str:
+    """"" when ``remote`` is the service Codeskys created for ``project``, else why not."""
+    expected = project["coolify_app_name"] or project["slug"]
+    if (remote.get("name") or "") != expected:
+        return f"its name {remote.get('name')!r} is not the one Codeskys created ({expected!r})"
+    if (remote.get("description") or "") != owner_marker(project):
+        return "it does not carry the Codeskys ownership marker"
+    if remote.get("service_type"):
+        return f"it is a template service ({remote.get('service_type')!r})"
+    return ""
+
+
+def verify_coolify_owner(api, app_uuid: str, project) -> dict:
+    """The service, if it is the one Codeskys created for ``project``; else CoolifyError."""
+    remote = api.get_app(app_uuid)
+    problem = ownership_problem(remote, project)
+    if problem:
+        raise CoolifyError(f"Refusing to touch app service {app_uuid}: {problem}. "
+                           "An administrator must check it.")
+    return remote
+
+
+def verify_coolify_app(api, app_uuid: str, project, expected_compose: dict | None = None) -> dict:
+    """Refuse to touch, build or start a service that is not exactly ours, in a safe state."""
+    remote = api.get_app(app_uuid)
+    problems = [p for p in [ownership_problem(remote, project)] if p]
+    problems += buildpolicy.coolify_service_problems(remote, expected_compose)
+    if problems:
+        raise CoolifyError("Refusing to build: the app service is not in the expected safe state ("
+                           + "; ".join(problems) + "). An administrator must check it.")
+    return remote
+
+
+def service_url(remote: dict) -> str:
+    """The ``app`` container's first URL as Coolify stored it (without the container
+    port Codeskys appends for routing), or ""."""
+    for sub in remote.get("applications") or []:
+        if isinstance(sub, dict) and sub.get("name") == "app":
+            first = (sub.get("fqdn") or "").split(",")[0].strip()
+            parts = urlsplit(first)
+            return f"{parts.scheme}://{parts.hostname}{parts.path.rstrip('/')}" if parts.hostname else ""
+    return ""
 
 
 def _run_coolify(conn, app_config, dep, project, beat):
     api, s = client_for(conn, app_config)
     dep_id = dep["id"]
-    scheme = "https" if s.get("force_https", True) else "http"
-    domain = f"{scheme}://{project['slug']}.{s['base_domain']}" if s["base_domain"] else None
+    domain, public_url = app_domains(project["slug"], s)
     remote = dep["provider_ref"]
 
     # Restart recovery: a deployment already handed to Coolify is resumed, not re-triggered.
     if remote:
-        _log(conn, dep_id, f"Resuming Coolify deployment {remote} after a worker restart.", "warn", "building")
-        return _poll_coolify(conn, api, dep, project, remote, domain, beat)
+        _log(conn, dep_id, f"Resuming deployment {remote} after a worker restart.", "warn", "building")
+        return _poll_coolify(conn, api, dep, project, remote, public_url, beat, s, resumed=True)
 
-    app_uuid = project["provider_ref"]
     _set(conn, dep_id, stage="provisioning")
-    if runtime_secrets.enabled(app_config) and _col(project, "authz_project_id", ""):
-        return _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat)
-    body = _app_body(project, dep, s, domain)
-    if not app_uuid:
-        create = {**body, "project_uuid": s["project_uuid"], "server_uuid": s["server_uuid"],
-                  "environment_name": s["environment_name"], "name": project["slug"],
-                  "description": (project["description"] or "")[:200], "instant_deploy": False}
-        if s.get("destination_uuid"):
-            create["destination_uuid"] = s["destination_uuid"]
-        if project["is_private"] and s.get("github_app_uuid"):
-            # Read-only GitHub App: Coolify mints its own short-lived installation
-            # token per build. Nothing is added to the student's repository.
-            create["github_app_uuid"] = s["github_app_uuid"]
-            create["git_repository"] = project["repo_full_name"] or create["git_repository"]
-            _log(conn, dep_id, "Creating private application on Coolify through the read-only GitHub App.",
-                 stage="provisioning")
-            app_uuid = api.create_github_app_app(create)
-        elif project["is_private"]:
-            if not s["private_key_uuid"]:
-                raise CoolifyError(
-                    "This repository is private. Configure the Coolify GitHub App source (Integrations → "
-                    "GitHub App UUID), or a Coolify deploy key, then redeploy.")
-            create["private_key_uuid"] = s["private_key_uuid"]
-            _log(conn, dep_id, "Creating private application on Coolify using the configured deploy key.",
-                 stage="provisioning")
-            app_uuid = api.create_private_app(create)
-        else:
-            _log(conn, dep_id, f"Creating application on Coolify ({s['url']})", stage="provisioning")
-            app_uuid = api.create_public_app(create)
-        conn.execute("UPDATE projects SET provider_ref = ?, coolify_app_name = ?, provider = 'coolify' WHERE id = ?",
-                     (app_uuid, project["slug"], project["id"]))
-        conn.commit()
-        _log(conn, dep_id, f"Application created: {app_uuid}", "success", "provisioning")
-    else:
-        _log(conn, dep_id, f"Syncing build settings to Coolify application {app_uuid}", stage="provisioning")
-        api.update_app(app_uuid, body)
-    beat()
-
-    envs = conn.execute("SELECT key, value, value_cipher, is_secret, targets FROM env_vars WHERE project_id = ?",
-                        (project["id"],)).fetchall()
-    box = Secrets(app_config["ENCRYPTION_KEY"])
-    payload = []
-    for e in envs:
-        if dep["target"] not in e["targets"].split(","):
-            continue
-        if e["key"] in RUNTIME_ENV:
-            continue  # reserved: only Codeskys authorization may set these
-        value = e["value"] or ""
-        if e["is_secret"] and e["value_cipher"]:
-            value = box.decrypt(e["value_cipher"])
-        payload.append({"key": e["key"], "value": value, "is_preview": dep["target"] == "preview"})
-    if payload:
-        api.bulk_envs(app_uuid, payload)
-        _log(conn, dep_id, f"Synced {len(payload)} environment variable(s)", stage="provisioning")
-
-    # Deployment-bound credential, last, so a user variable can never shadow it.
-    runtime_env = authorize_deployment(conn, app_config, dep, project)
-    if runtime_env:
-        api.bulk_envs(app_uuid, runtime_env)
-
-    if _cancel_requested(conn, dep_id):
-        raise Cancelled()
-    _set(conn, dep_id, stage="building")
-    remote = api.deploy(app_uuid, force=dep["trigger"] == "redeploy-clear-cache")
-    _set(conn, dep_id, provider_ref=remote)
-    _log(conn, dep_id, f"Coolify deployment started: {remote}", stage="building")
-    return _poll_coolify(conn, api, dep, project, remote, domain, beat)
+    refusal = coolify_refusal(app_config, project)
+    if refusal:
+        raise CoolifyError(refusal)
+    if not domain:
+        raise CoolifyError("This app has no public address configured: an administrator must set the "
+                           "wildcard base domain before deployments can go live.")
+    return _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, public_url)
 
 
-def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat):
-    """App + runtime-proxy sidecar, from a compose file Codeskys generates.
+def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, public_url=None):
+    """The student's app as one Coolify service, from a compose file Codeskys generates.
 
-    Order matters: the deployment credential is obtained (and written as the
-    sidecar's secret file) BEFORE the application exists, because the compose
-    file names that deployment. The student repository is never modified.
+    Checks that need no Coolify call come first, then authz, then the service is
+    created (or its compose file replaced), verified and started. A service this
+    deployment created is deleted again when a step before the start fails. The
+    student repository is never modified.
     """
     import base64
     from . import composegen
     dep_id = dep["id"]
-    if project["is_private"]:
-        raise CoolifyError("Protected Codeskys services are not available yet for private repositories "
-                           "(the sidecar build needs a read-only clone path). Deploy a public repository, "
-                           "or ask an administrator to unlink authorization for this project.")
-    authorize_deployment(conn, app_config, dep, project)          # raises AuthorizationRefused
+    if project["framework"] == "docker":
+        # The repository's own Dockerfile (framework projects get one generated by Codeskys,
+        # which composegen.assert_safe_service checks line by line).
+        root = (project["root_dir"] or "").strip("/")
+        try:
+            buildpolicy.check_dockerfile(project["repo_url"], dep["commit_sha"],
+                                         f"{root}/Dockerfile" if root else "Dockerfile")
+        except buildpolicy.PolicyError as exc:
+            raise CoolifyError(str(exc)) from None
+        _log(conn, dep_id, "Dockerfile checked: no host networking, insecure mode or devices requested.",
+             stage="provisioning")
+    else:
+        from . import dockerfiles
+        try:
+            dockerfiles.settings(project)                        # fail before Coolify is asked anything
+        except dockerfiles.DockerfileError as exc:
+            raise CoolifyError(str(exc)) from None
+        _log(conn, dep_id, f"Building with the Codeskys {FRAMEWORKS[project['framework']]['name']} "
+                           "Dockerfile (isolated build, unprivileged container).", stage="provisioning")
+    authorize_deployment(conn, app_config, dep, project, with_credential=False)   # raises AuthorizationRefused
     dep = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
     project = conn.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
-    host_dir = app_config.get("RUNTIME_SECRET_HOST_DIR") or app_config["RUNTIME_SECRET_DIR"]
-    secret_host_file = f"{host_dir.rstrip('/')}/{dep['authz_deployment_id']}/runtime_secret"
     keys = [r["key"] for r in conn.execute(
         "SELECT key FROM env_vars WHERE project_id = ? AND (',' || targets || ',') LIKE ?",
         (project["id"], f"%,{dep['target']},%"))]
     try:
-        doc = composegen.for_project(project, dep, app_config=app_config,
-                                     secret_host_file=secret_host_file, env_keys=keys)
+        doc = composegen.for_service(project, dep, env_keys=keys)
     except composegen.ComposeError as exc:
         raise CoolifyError(f"Could not prepare the deployment: {exc}.") from None
+    skipped = sorted({k for k in keys if composegen.coolify_reserved(k)})
+    if skipped:
+        _log(conn, dep_id, "Not passed to the app (names reserved by Codeskys): " + ", ".join(skipped),
+             "warn", "provisioning")
     raw = base64.b64encode(composegen.render(doc).encode("utf-8")).decode("ascii")
-    _log(conn, dep_id, "Prepared app + Codeskys runtime sidecar (isolated private network; the app has "
-                       "no route to Codeskys internals).", stage="provisioning")
-    body = {"project_uuid": s["project_uuid"], "server_uuid": s["server_uuid"],
-            "environment_name": s["environment_name"], "name": project["slug"],
-            "docker_compose_raw": raw, "instant_deploy": False}
-    if s.get("destination_uuid"):
-        body["destination_uuid"] = s["destination_uuid"]
-    app_uuid = project["provider_ref"]
+    _log(conn, dep_id, "Prepared the app as an isolated service (its own network, shared only with "
+                       "the proxy; no route to Codeskys internals).", stage="provisioning")
+    # The port tells Traefik which container port to use; the Host rule has no port.
+    fields = {"description": owner_marker(project), "docker_compose_raw": raw, "connect_to_docker_network": False,
+              "urls": [{"name": "app", "url": f"{domain}:{composegen.service_port(doc)}"}]}
+    app_uuid, created = project["provider_ref"], False
     if app_uuid:
-        api.update_app(app_uuid, {"docker_compose_raw": raw})
+        verify_coolify_owner(api, app_uuid, project)             # never change a service that is not ours
+        api.update_service(app_uuid, fields)
     else:
-        app_uuid = api.create_compose_app(body)
+        body = {"project_uuid": s["project_uuid"], "server_uuid": s["server_uuid"],
+                "environment_name": s["environment_name"], "name": project["slug"], "instant_deploy": False,
+                **fields}
+        if s.get("destination_uuid"):
+            body["destination_uuid"] = s["destination_uuid"]
+        app_uuid, created = api.create_service(body), True
         conn.execute("UPDATE projects SET provider_ref = ?, coolify_app_name = ?, provider = 'coolify' WHERE id = ?",
                      (app_uuid, project["slug"], project["id"]))
         conn.commit()
         project = conn.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
-    box = Secrets(app_config["ENCRYPTION_KEY"])
-    values = []
-    for e in conn.execute("SELECT key, value, value_cipher, is_secret, targets FROM env_vars WHERE project_id = ?",
-                          (project["id"],)).fetchall():
-        if dep["target"] not in e["targets"].split(",") or e["key"] in composegen.RESERVED:
-            continue
-        v = box.decrypt(e["value_cipher"]) if e["is_secret"] and e["value_cipher"] else (e["value"] or "")
-        values.append({"key": e["key"], "value": v, "is_preview": dep["target"] == "preview"})
-    if values:
-        api.bulk_envs(app_uuid, values)
-    beat()
-    if _cancel_requested(conn, dep_id):
-        raise Cancelled()
-    _set(conn, dep_id, stage="building")
-    remote = api.deploy(app_uuid, force=dep["trigger"] == "redeploy-clear-cache")
-    _set(conn, dep_id, provider_ref=remote)
-    _log(conn, dep_id, f"Coolify deployment started: {remote}", stage="building")
-    return _poll_coolify(conn, api, dep, project, remote, domain, beat)
-
-
-def _poll_coolify(conn, api, dep, project, remote, domain, beat):
-    dep_id = dep["id"]
-    seen = 0
-    deadline = time.time() + 60 * 45
-    while time.time() < deadline:
-        if _cancel_requested(conn, dep_id):
-            try:
-                api.cancel_deployment(remote)
-            except CoolifyError as exc:
-                _log(conn, dep_id, f"Coolify could not cancel the build: {exc}", "warn", "cancelled")
-            raise Cancelled()
-        data = api.deployment(remote)
-        seen = _copy_logs(conn, dep_id, data, seen)
-        status = (data.get("status") or "").lower()
-        if status in ("finished", "success"):
-            url = domain
-            try:
-                fqdn = (api.get_app(project["provider_ref"]).get("fqdn") or "").split(",")[0]
-                url = fqdn or domain
-            except CoolifyError:
-                pass
-            _log(conn, dep_id, f"Deployment ready → {url or 'no domain configured'}", "success", "ready")
-            _finish(conn, dep, project, "ready", url=url)
-            return
-        if status in ("failed", "error"):
-            _finish(conn, dep, project, "failed",
-                    error="Coolify reported the build as failed. The build log above has the detail.")
-            return
-        if status.startswith("cancel"):
-            _finish(conn, dep, project, "cancelled")
-            return
-        beat()
-        time.sleep(3)
-    _finish(conn, dep, project, "failed", error="Timed out after 45 minutes waiting for Coolify.")
-
-
-def _copy_logs(conn, dep_id, data, seen):
-    raw = data.get("logs") or "[]"
+        _log(conn, dep_id, f"App service {app_uuid} created.", stage="provisioning")
     try:
-        entries = json.loads(raw) if isinstance(raw, str) else raw
-    except ValueError:
-        entries = []
-    if not isinstance(entries, list):
-        return seen
-    visible = [e for e in entries if isinstance(e, dict) and not e.get("hidden")]
-    for entry in visible[seen:]:
-        line = (entry.get("output") or "").rstrip()
-        if line:
-            _log(conn, dep_id, line, "error" if entry.get("type") == "stderr" else "info", "building")
-    return len(visible)
+        box = Secrets(app_config["ENCRYPTION_KEY"])
+        values = []
+        for e in conn.execute("SELECT key, value, value_cipher, is_secret, targets FROM env_vars "
+                              "WHERE project_id = ?", (project["id"],)).fetchall():
+            if dep["target"] not in e["targets"].split(",") or composegen.coolify_reserved(e["key"]):
+                continue
+            v = box.decrypt(e["value_cipher"]) if e["is_secret"] and e["value_cipher"] else (e["value"] or "")
+            # Literal: Coolify must not expand ${...} in a student's value.
+            values.append({"key": e["key"], "value": v, "is_literal": True})
+        api.bulk_envs(app_uuid, values)
+        was_running = _app_running(str(verify_coolify_app(api, app_uuid, project, doc).get("status") or ""))
+        beat()
+        if _cancel_requested(conn, dep_id):
+            raise Cancelled()
+    except (CoolifyError, Cancelled):
+        if created:
+            _remove_unstarted_service(conn, api, dep_id, project)
+        raise
+    _set(conn, dep_id, stage="building")
+    api.run_app(app_uuid)
+    _set(conn, dep_id, provider_ref=app_uuid)
+    _log(conn, dep_id, "Building and starting the app. Build output is not reported for this kind of "
+                       "deployment; the app's own output is shown if it fails to start.", stage="building")
+    return _poll_coolify(conn, api, dep, project, app_uuid, public_url or domain, beat, s,
+                         previous_running=was_running)
+
+
+def _remove_unstarted_service(conn, api, dep_id, project):
+    """Rollback: delete the service this deployment created before anything was started.
+    If that fails the service stays attached to the project and the next deploy reuses it."""
+    uuid = project["provider_ref"]
+    try:
+        verify_coolify_owner(api, uuid, project)
+        api.delete_app(uuid)
+    except CoolifyError as exc:
+        _log(conn, dep_id, f"The new app service {uuid} could not be removed ({exc}); the next deploy "
+                           "reuses it.", "warn", "provisioning")
+        return
+    conn.execute("UPDATE projects SET provider_ref = NULL, coolify_app_name = '' WHERE id = ?", (project["id"],))
+    conn.commit()
+    _log(conn, dep_id, f"The new app service {uuid} was removed again.", "warn", "provisioning")
+
+
+POLL_SECONDS = 3            # between Coolify status reads (tests shorten it)
+POLL_ERROR_LIMIT = 20       # consecutive failed reads (~1 minute) before giving up
+START_GRACE = 90            # seconds Coolify's queue may take to begin a start
+BUILD_TIMEOUT = 60 * 45
+
+
+def _poll_coolify(conn, api, dep, project, remote, domain, beat, settings=None, resumed=False,
+                  previous_running=False):
+    """Wait for Coolify's build/start (status "starting:…") to end, then check readiness.
+
+    Coolify returns no deployment id for a service, so the only progress signal is the
+    status. When the previous version was running before the start, "running" means
+    nothing until Coolify has shown "starting" (the redeploy may still be queued).
+    """
+    dep_id = dep["id"]
+    errors, seen_starting = 0, False
+    begun = time.time()
+    while time.time() < begun + BUILD_TIMEOUT:
+        if _cancel_requested(conn, dep_id):
+            _cancel_coolify_build(conn, api, dep_id, project, beat)
+            raise Cancelled()
+        try:
+            status = str(api.get_app(remote).get("status") or "").lower()
+        except CoolifyError as exc:
+            # A short Coolify outage must not fail a build that is still running there.
+            errors += 1
+            if errors >= POLL_ERROR_LIMIT:
+                raise CoolifyError(f"Lost contact with the deployment engine while building: {exc}") from None
+            if errors == 1:
+                _log(conn, dep_id, f"The deployment engine did not answer ({exc}); retrying.", "warn", "building")
+            beat()
+            time.sleep(POLL_SECONDS)
+            continue
+        errors = 0
+        if status.startswith("starting"):
+            seen_starting = True
+        elif seen_starting or resumed:
+            break
+        elif previous_running:
+            if time.time() - begun >= START_GRACE:
+                _finish(conn, dep, project, "failed",
+                        error=f"The new version did not start within {START_GRACE} seconds; the "
+                              "previous version is still running. Try again in a few minutes.")
+                return
+        elif _app_running(status) or time.time() - begun >= START_GRACE:
+            break
+        beat()
+        time.sleep(POLL_SECONDS)
+    else:
+        _stop_unready_app(conn, api, dep_id, project)
+        _finish(conn, dep, project, "failed", error="Timed out after 45 minutes waiting for the build.")
+        return
+    # The build finishing is not the app working: verify before "ready",
+    # so the 24-hour window only starts once the URL actually serves the app.
+    problem = verify_app_ready(conn, api, dep, project, domain, beat, settings or {})
+    if problem:
+        _stop_unready_app(conn, api, dep_id, project)
+        _finish(conn, dep, project, "failed", error=problem)
+        return
+    _log(conn, dep_id, f"Deployment ready → {domain}", "success", "ready")
+    _finish(conn, dep, project, "ready", url=domain)
+
+
+def _cancel_coolify_build(conn, api, dep_id, project, beat):
+    """Stop the service (Coolify has no cancel for a service start), retrying a few
+    times, then keep it stopped with a durable job."""
+    for attempt in range(3):
+        try:
+            api.stop_app(project["provider_ref"])
+            break
+        except CoolifyError as exc:
+            if attempt == 2:
+                _log(conn, dep_id, f"The deployment engine could not stop the build: {exc}", "warn", "cancelled")
+            else:
+                beat()
+                time.sleep(POLL_SECONDS)
+    conn.execute("UPDATE projects SET app_state = 'stopped' WHERE id = ?", (project["id"],))
+    conn.commit()
+    schedule_quiesce(conn, project["id"], project["provider_ref"], dep_id)
+
+
+# ---------------------------------------------------------------- readiness
+
+# Traefik's answer for a hostname it has no route for. A student app answering
+# 404 at "/" is fine (it is running); this exact body means nothing is behind the URL.
+_NO_ROUTE = "404 page not found"
+
+
+def probe_app(url: str, probe_base: str = "", timeout: float = 5.0) -> tuple:
+    """(ok, detail) for one HTTP request to the app.
+
+    With ``probe_base`` (e.g. ``http://coolify-proxy:80``) the request goes there
+    with the app's Host header, inside the server; otherwise to ``url`` itself.
+    Redirects are not followed: a 3xx means the app answered.
+    """
+    parts = urlsplit(url)
+    target, headers = url, {"User-Agent": "Codeskys-readiness/1"}
+    if probe_base:
+        target = probe_base.rstrip("/") + (parts.path or "/")
+        headers["Host"] = parts.hostname or ""
+    try:
+        r = requests.get(target, headers=headers, timeout=timeout, allow_redirects=False)
+    except requests.RequestException as exc:
+        return False, f"no answer ({exc.__class__.__name__})"
+    if r.status_code == 404 and (r.text or "").strip() == _NO_ROUTE:
+        return False, "the proxy has no route to the app yet"
+    if r.status_code >= 500:
+        return False, f"HTTP {r.status_code}"
+    return True, f"HTTP {r.status_code}"
+
+
+def _app_running(status: str) -> bool:
+    status = (status or "").lower()
+    return status.startswith("running") and "unhealthy" not in status
+
+
+def verify_app_ready(conn, api, dep, project, url, beat, settings) -> str:
+    """"" once the application is running and its URL answers, else why not.
+
+    Two consecutive passing checks are required, so a container that starts and
+    then crash-loops is not reported as live.
+    """
+    dep_id = dep["id"]
+    if not url:
+        return ("The build finished, but no public address is configured for this app. "
+                "An administrator must set the wildcard base domain.")
+    _set(conn, dep_id, stage="deploying")
+    _log(conn, dep_id, f"Build finished. Checking that the app is running and answers at {url} …",
+         stage="deploying")
+    timeout = int(settings.get("ready_timeout") or 180)
+    deadline = time.time() + timeout
+    passes, last = 0, "the application did not report as running"
+    while True:
+        if _cancel_requested(conn, dep_id):
+            _stop_unready_app(conn, api, dep_id, project)
+            raise Cancelled()
+        try:
+            state = str(api.get_app(project["provider_ref"]).get("status") or "")
+        except CoolifyError as exc:
+            state, last = "", f"could not read the application status ({exc})"
+        if _app_running(state):
+            ok, detail = probe_app(url, settings.get("probe_url", ""))
+            if ok:
+                passes += 1
+                if passes >= 2:
+                    _log(conn, dep_id, f"Health check passed ({detail}).", "success", "deploying")
+                    return ""
+            else:
+                passes, last = 0, f"the URL check failed: {detail}"
+        else:
+            passes = 0
+            if state:
+                last = f"the application is {state}"
+        if time.time() >= deadline:
+            break
+        beat()
+        time.sleep(POLL_SECONDS)
+    _copy_app_logs(conn, api, dep_id, project)
+    return (f"The build finished, but the app did not become available within {timeout} seconds "
+            f"({last}). Check that it listens on the expected port; the log above has its output.")
+
+
+def _copy_app_logs(conn, api, dep_id, project, lines=40):
+    """The app's own output, so a crash at start-up is visible in the build log."""
+    try:
+        data = api.app_logs(project["provider_ref"], lines=lines)
+    except CoolifyError:
+        return
+    text = data.get("logs") if isinstance(data, dict) else data
+    if isinstance(text, str) and text.strip():
+        _log(conn, dep_id, "Application output (last lines):", "warn", "deploying")
+        for line in text.strip().splitlines()[-lines:]:
+            _log(conn, dep_id, line, "error", "deploying")
+
+
+def _stop_unready_app(conn, api, dep_id, project):
+    """A build that did not go live must not stay running (crash loops, half-started apps)."""
+    try:
+        api.stop_app(project["provider_ref"])
+        _log(conn, dep_id, "The application was stopped.", "warn", "deploying")
+    except CoolifyError as exc:
+        _log(conn, dep_id, f"The deployment engine could not stop the application: {exc}", "warn", "deploying")
+    if project["current_deployment_id"] and project["current_deployment_id"] != dep_id:
+        # Coolify replaced the previous containers with this build, so that version is gone too.
+        _log(conn, dep_id, "The previously published version is no longer running. "
+                           "Fix the problem and deploy again.", "warn", "deploying")
+    conn.execute("UPDATE projects SET app_state = 'stopped' WHERE id = ?", (project["id"],))
+    conn.commit()

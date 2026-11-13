@@ -146,7 +146,8 @@ class StatusTests(AppTestCase):
     def test_status_reports_coolify_not_configured(self):
         self.login(STUDENT[0], STUDENT[2])
         data = self.client.get("/api/platform/status").get_json()
-        self.assertEqual(data["coolify"]["state"], "not_configured")
+        self.assertEqual(data["engine"]["state"], "not_configured")
+        self.assertNotIn("coolify", data)  # backend details are for administrators
         self.assertIsNone(data["users"])  # students don't see user counts
 
     def test_status_admin_sees_user_count_and_never_the_token(self):

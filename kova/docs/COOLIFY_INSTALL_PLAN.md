@@ -1,6 +1,12 @@
 # Coolify v4 on the Codeskys VPS: install and rollback plan
 
 **Status (2026-11-06): PREPARED ONLY. Nothing in this document has been run.**
+
+> **2026-11-12: partly superseded** by forgeops `ops/engine/COOLIFY_SINGLE_VPS_PLAN.md` (pinned
+> 4.7.5, HTTPS edge, three dedicated networks, compose-only builds, Coolify backup). Use that plan's
+> order of steps. Corrected here: the fingerprint file is `/root/baseline48.sql` (there is no
+> `/root/baseline.sql`), and `/opt/codeskys/forgeops` is **not** a git checkout, so every file a
+> step changes is copied to `/root/pre-coolify/` in step 0 and restored from there.
 The owner chose "Prepare only". Both Claude sessions working on Codeskys follow
 that decision. Installing needs a new, explicit approval.
 
@@ -70,8 +76,13 @@ iptables -S DOCKER-USER > /root/pre-coolify-docker-user.txt
 cp -a /etc/docker/daemon.json /root/pre-coolify-daemon.json
 cp -a /root/.ssh/authorized_keys /root/pre-coolify-authorized_keys
 docker ps --format '{{.Names}} {{.Status}}' > /root/pre-coolify-containers.txt
-# student fingerprint (same query as the baseline; must equal it)
-docker compose exec -T postgres psql -U forge -d forgeops -tA < /root/baseline.sql
+# Files later steps change. Not a git checkout: these copies ARE the rollback.
+install -d -m 0700 /root/pre-coolify
+cp -a ops/vps-https .env /etc/codeskys/codeskys.env /etc/codeskys/website.env /root/pre-coolify/
+cp -a /etc/ufw/user.rules /etc/ufw/user6.rules /root/pre-coolify/
+# student fingerprint: must equal the recorded baseline
+docker compose exec -T postgres psql -U forge -d forgeops -tA < /root/baseline48.sql | tee /root/pre-coolify/fp.txt
+diff /root/pre-coolify/fp.txt /root/step2-20261112T075247Z/fp.before && echo fingerprint-equals-baseline
 
 # 1. Fetch and verify the installer (do NOT pipe curl into bash)
 curl -fsSL https://cdn.coollabs.io/coolify/install.sh -o /root/coolify-install.sh
@@ -130,7 +141,9 @@ becomes admin; the tunnel guarantees that is us). Then enable 2FA.
 #    "coolify" network, and also joins "codeskys-apps". Then Start the proxy.
 docker inspect coolify-proxy --format '{{json .HostConfig.PortBindings}}'   # must be {}
 
-# 7. Caddy forwards test-app hostnames to Traefik (brief Caddy recreate: ~2 s)
+# 7. SUPERSEDED (HTTP-era): the VPS now runs ops/vps-https/. Use the single-VPS plan §9.6
+#    (Caddyfile.https.coolify + docker-compose.coolify.yml). Kept for reference only.
+#    Caddy forwards test-app hostnames to Traefik (brief Caddy recreate: ~2 s)
 #    ops/vps-http/Caddyfile.http, ABOVE the ":80" site:
 #      http://*.129-121-169-143.sslip.io {
 #          import common
@@ -249,13 +262,17 @@ rm -rf /data/coolify
 cp /root/.ssh/authorized_keys /root/authorized_keys.with-coolify
 sed -i -E '/[[:space:]](root@)?coolify[[:space:]]*$/d' /root/.ssh/authorized_keys
 diff /root/.ssh/authorized_keys /root/pre-coolify-authorized_keys && echo keys-restored
-# 5. revert Caddy (git checkout the two files) and website.env COOLIFY_* lines, then
-cd /opt/codeskys/forgeops && docker compose up -d --no-deps caddy website
+# 5. put back the files saved in step 0 (no git here), then recreate what used them
+cd /opt/codeskys/forgeops
+rm -rf ops/vps-https && cp -a /root/pre-coolify/vps-https ops/vps-https
+cp -a /root/pre-coolify/.env .env
+cp -a /root/pre-coolify/codeskys.env /root/pre-coolify/website.env /etc/codeskys/
+docker compose up -d --no-deps caddy website authz dataapi   # the four the overlay touched
 # 6. verify
 cmp /etc/docker/daemon.json /root/pre-coolify-daemon.json && echo daemon-unchanged
 diff <(iptables -S DOCKER-USER) /root/pre-coolify-docker-user.txt && echo guard-unchanged
 bash ops/vps/healthcheck.sh; echo "health=$?"
-docker compose exec -T postgres psql -U forge -d forgeops -tA < /root/baseline.sql   # = baseline
+docker compose exec -T postgres psql -U forge -d forgeops -tA < /root/baseline48.sql | diff - /root/pre-coolify/fp.txt && echo fingerprint-unchanged
 ```
 Also revoke the Coolify API token and the GitHub App client secret that were
 given to Coolify (GitHub → App settings → regenerate client secret).

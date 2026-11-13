@@ -23,6 +23,11 @@ from pathlib import Path
 
 _DEP = re.compile(r"^dep_[A-Za-z0-9]{6,28}$")
 
+# Groups that guard platform secrets on the VPS (forgeops ops/vps-http/provision.sh):
+# 0 root, 1998 codeskys-ghkey (GitHub App private key), 1999 codeskys-runtime (the
+# platform's own runtime secret). Student sidecars must never be given one of them.
+PLATFORM_SECRET_GIDS = frozenset({0, 1998, 1999})
+
 
 class SinkError(RuntimeError):
     pass
@@ -49,6 +54,8 @@ def _gid(app_config):
     gid = int(gid)
     if not 1 <= gid <= 65535:
         raise SinkError("invalid runtime secret group id")
+    if gid in PLATFORM_SECRET_GIDS:
+        raise SinkError("runtime secret group id is reserved for platform secrets")
     return gid
 
 

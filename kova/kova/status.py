@@ -24,20 +24,25 @@ def health():
 @bp.get("/platform/status")
 @login_required
 def platform_status():
-    """Real status only. Coolify is reported as not_configured until Phase 5 adds the live check."""
+    """Real status only. The engine is reported as not_configured until Phase 5 adds the live check.
+
+    Students get neutral ``engine`` fields only; the ``coolify`` block (with its
+    internal host) is for administrators."""
     from .engine import active_provider, coolify_settings
     cs = coolify_settings(get_db(), current_app.config)
     url, token = cs["url"], cs["token"]
     configured = bool(url and token)
-    coolify = {"configured": configured, "state": "unchecked" if configured else "not_configured",
-               "host": urlparse(url).netloc if url else None}
+    engine = {"configured": configured, "state": "unchecked" if configured else "not_configured"}
     row = get_db().execute("SELECT COUNT(*) AS n FROM users").fetchone()
     is_admin = current_user()["role"] == "admin"
-    return jsonify(
+    out = dict(
         platform=current_app.config["PLATFORM_NAME"],
         version=current_app.config["VERSION"],
         database={"ok": True},
-        coolify=coolify,
+        engine=engine,
         provider=active_provider(get_db(), current_app.config),
         users=row["n"] if is_admin else None,
     )
+    if is_admin:
+        out["coolify"] = engine | {"host": urlparse(url).netloc if url else None}
+    return jsonify(**out)

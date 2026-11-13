@@ -2,6 +2,7 @@
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import requests
 from flask import Blueprint, current_app, jsonify, request
@@ -151,7 +152,7 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
     db.execute("INSERT INTO deploy_logs (deployment_id, ts, level, stage, line) VALUES (?,?,?,?,?)",
                (dep_id, utcnow(), "info", "queued",
                 f"Deployment #{number} queued ({trigger}, {target}, branch {branch}) on the "
-                f"{'Coolify' if provider == engine.COOLIFY else 'simulator'} engine"))
+                f"{'live' if provider == engine.COOLIFY else 'simulator'} engine"))
     db.commit()
     engine.enqueue_deploy(db, dep_id)
     return dep_id
@@ -442,13 +443,11 @@ def delete_project(slug):
     if pending and not data.get("force"):
         return err("Codeskys could not revoke this project's deployment credentials, so it was not "
                    "deleted. Try again shortly, or ask an administrator.", 503)
-    if p["provider_ref"]:
-        try:
-            s = engine.coolify_settings(db, current_app.config)
-            if s["url"] and s["token"]:
-                engine.Coolify(s["url"], s["token"]).delete_app(p["provider_ref"])
-        except engine.CoolifyError as exc:
-            current_app.logger.warning("Coolify delete failed: %s", exc)
+    if p["provider_ref"] and p["provider"] == engine.COOLIFY:
+        # Same guard as expiry: only a service Codeskys created for this project is deleted.
+        note = engine.teardown_coolify_app(db, current_app.config, p)
+        if "deleted" not in note and "already gone" not in note:
+            current_app.logger.warning("Coolify delete for project %s: %s", slug, note)
     db.execute("DELETE FROM projects WHERE id = ?", (p["id"],))
     db.commit()
     audit("project.deleted", actor_id=current_user()["id"], target=slug, ip=request.remote_addr)
@@ -663,7 +662,14 @@ def app_status(slug):
     status = str(remote.get("status") or "unknown")
     get_db().execute("UPDATE projects SET app_state = ? WHERE id = ?", (status[:40], p["id"]))
     get_db().commit()
-    return jsonify(status=status, fqdn=(remote.get("fqdn") or "").split(",")[0] or None)
+    # Only an address under the Codeskys app domain, never one Coolify generated
+    # itself (such as <uuid>.<server-ip>.sslip.io).
+    fqdn = engine.service_url(remote)
+    base = (engine.coolify_settings(get_db(), current_app.config).get("base_domain") or "").lower().strip(".")
+    host = (urlsplit(fqdn).hostname or "") if fqdn else ""
+    if not (base and host.endswith("." + base)):
+        fqdn = ""
+    return jsonify(status=status, fqdn=fqdn or None)
 
 
 @bp.post("/projects/<slug>/app/<action>")
@@ -677,6 +683,14 @@ def app_action(slug, action):
     if action in ("start", "restart") and p["is_paused"]:
         return err("This project is paused. Resume it in Settings first.", 409)
     db = get_db()
+    if action in ("start", "restart"):
+        # Starting an expired or failed app would bring its URL back without a new
+        # 24-hour window: only the live deployment's app may be started.
+        live = db.execute("SELECT status, expires_at FROM deployments WHERE id = ?",
+                          (p["current_deployment_id"],)).fetchone() if p["current_deployment_id"] else None
+        if live is None or live["status"] != "ready" or (live["expires_at"] and live["expires_at"] <= utcnow()):
+            return err("This app has no live deployment (it expired or did not go live). "
+                       "Deploy the project again to publish it.", 409)
     user = current_user()
     if rate_limit(db, f"app:{user['id']}", limit=20, per_seconds=300):
         return err("Too many start/stop requests. Wait a moment and try again.", 429)
@@ -684,9 +698,14 @@ def app_action(slug, action):
     if error:
         return error
     try:
+        if action in ("start", "restart"):
+            # Coolify's start builds the service again: same check as a deploy.
+            engine.verify_coolify_app(api, p["provider_ref"], p)
+        else:
+            engine.verify_coolify_owner(api, p["provider_ref"], p)
         getattr(api, _APP_ACTIONS[action])(p["provider_ref"])
     except engine.CoolifyError as exc:
-        return err(f"Coolify could not {action} the application: {exc}", 502)
+        return err(f"The deployment engine could not {action} the application: {exc}", 502)
     state = {"start": "starting", "stop": "stopped", "restart": "restarting"}[action]
     db.execute("UPDATE projects SET app_state = ?, updated_at = ? WHERE id = ?", (state, utcnow(), p["id"]))
     db.commit()

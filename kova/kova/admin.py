@@ -325,15 +325,20 @@ def test_coolify():
     api = engine.Coolify(s["url"], s["token"], timeout=8)
     try:
         version = api.version()
-        servers = api.servers()
         projects = api.projects()
+        # A token scoped to one Coolify project (the recommended Codeskys token) is
+        # refused (403) on team-level endpoints such as servers and keys.
+        try:
+            servers = api.servers()
+        except engine.CoolifyError:
+            servers = []
         try:
             keys = api.private_keys()
         except engine.CoolifyError:
             keys = []
     except engine.CoolifyError as exc:
         set_setting(db, "coolify_last_check", f"failed {utcnow()}")
-        return jsonify(ok=False, error=str(exc)), 502
+        return jsonify(ok=False, error=exc.detail), 502
     v = version.get("raw") if isinstance(version, dict) and "raw" in version else version
     set_setting(db, "coolify_last_check", f"ok {utcnow()}")
     set_setting(db, "coolify_version", str(v)[:40])

@@ -24,6 +24,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 from .db import connect, utcnow
+from .security import redact
 
 HANDLERS = {}
 DEFAULT_LEASE = 900          # 15 min; long builds heartbeat to extend it
@@ -169,7 +170,7 @@ def _give_up(conn, job, detail):
         conn.execute(
             "UPDATE deployments SET status='failed', stage='failed', error=?, finished_at=? "
             "WHERE id = ? AND status IN ('queued','building')",
-            (f"Build gave up after {job['attempts']} attempts. {detail}"[:500], utcnow(), dep_id))
+            (f"Build gave up after {job['attempts']} attempts. {redact(detail)}"[:500], utcnow(), dep_id))
         conn.commit()
 
 
@@ -184,6 +185,22 @@ def sweep(conn, app_config):
     queued = 0
     for row in due:
         if enqueue(conn, "expire", {"deployment_id": row["id"]}, dedupe_key=f"expire:{row['id']}"):
+            queued += 1
+
+    # Catch-up for anything a handler could not finish: a credential still unrevoked
+    # on a deployment that is over, or an expired app still present on Coolify.
+    # Both enqueue with a fixed dedupe key, so this is a no-op while a retry is queued.
+    from . import engine                       # lazy: engine imports this module
+    for row in conn.execute(
+            "SELECT id, authz_deployment_id FROM deployments WHERE authz_deployment_id != '' "
+            "AND authz_revoked_at IS NULL AND status IN ('failed','cancelled','expired') LIMIT 200").fetchall():
+        if engine.schedule_revoke_retry(conn, row["authz_deployment_id"], row["id"], "deployment over"):
+            queued += 1
+    for row in conn.execute(
+            "SELECT id, provider_ref FROM projects WHERE provider = 'coolify' AND provider_ref IS NOT NULL "
+            "AND provider_ref != '' AND current_deployment_id IS NULL LIMIT 200").fetchall():
+        if engine.teardown_pending(conn, row["id"], row["provider_ref"]) and \
+                engine.schedule_teardown_retry(conn, row["id"], row["provider_ref"]):
             queued += 1
 
     from .ratelimit import prune
