@@ -130,3 +130,128 @@ def coolify_service_problems(service: dict, expected_compose: dict | None = None
         if expected_compose is not None and stored != expected_compose:
             problems.append("its compose file is not the one Codeskys generated")
     return problems
+
+
+# ---------------------------------------------------------------- entry-point preflight
+# A framework preset assumes a layout (``gunicorn app:app`` needs app.py). When the
+# repository does not have it, the build would run for minutes and the app would only
+# crash at start. Checked against the exact commit before Coolify is asked to build.
+
+_MODULE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_APP_REF = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):[A-Za-z_][A-Za-z0-9_]*(?:\(.*\))?$")
+# Server options that take a value (so the value is not mistaken for the app module).
+_VALUE_OPTS = {"-b", "--bind", "-w", "--workers", "-k", "--worker-class", "-t", "--timeout", "--host",
+               "--port", "--threads", "-c", "--config", "--log-level", "--root-path", "--env-file",
+               "--name", "-n", "--pythonpath", "--uds", "--fd", "--loop", "--http", "--ws", "--lifespan",
+               "--interface", "--workers-per-core"}
+_BASE_DIR_OPTS = {"--chdir", "--app-dir"}          # these move the base directory: not checked
+ENTRY_NAMES = ("main.py", "app.py", "wsgi.py", "asgi.py", "server.py", "manage.py")
+
+
+def _module_files(module: str) -> list[str]:
+    path = module.replace(".", "/")
+    return [f"{path}.py", f"{path}/__init__.py"]
+
+
+def required_files(install: str, start: str) -> list[tuple[str, list[str]]]:
+    """``[(what, [paths, any one of which must exist])]`` that the commands rely on."""
+    needs = []
+    try:
+        import shlex
+        words = shlex.split(install or "")
+    except ValueError:
+        words = (install or "").split()
+    for i, w in enumerate(words[:-1]):
+        if w in ("-r", "--requirement"):
+            needs.append((f"the install command's {words[i + 1]}", [words[i + 1]]))
+    if words[:2] in (["npm", "install"], ["npm", "ci"]):
+        needs.append(("package.json (for npm)", ["package.json"]))
+    try:
+        import shlex
+        tokens = shlex.split(start or "")
+    except ValueError:
+        return needs
+    if not tokens or any(t.split("=", 1)[0] in _BASE_DIR_OPTS for t in tokens):
+        return needs
+    if tokens[0] == "exec":
+        tokens = tokens[1:]
+    cmd = tokens[0] if tokens else ""
+    if cmd in ("gunicorn", "uvicorn"):
+        skip = False
+        for tok in tokens[1:]:
+            if skip:
+                skip = False
+                continue
+            if tok.startswith("-"):
+                skip = tok in _VALUE_OPTS
+                continue
+            m = _APP_REF.match(tok)
+            module = m.group(1) if m else (tok if cmd == "gunicorn" and _MODULE.match(tok) else "")
+            if module:
+                needs.append((f"the module {module} that the start command runs", _module_files(module)))
+            break
+    elif cmd in ("python", "python3") and len(tokens) > 1 and tokens[1].endswith(".py"):
+        needs.append((tokens[1], [tokens[1]]))
+    elif cmd == "streamlit" and len(tokens) > 2 and tokens[1] == "run":
+        needs.append((tokens[2], [tokens[2]]))
+    return needs
+
+
+def repository_files(repo_url: str, commit_sha: str, timeout: float = 10.0):
+    """Every file path at the commit, or None when GitHub cannot tell (never blocks a build)."""
+    m = _GITHUB.match((repo_url or "").rstrip("/").removesuffix(".git"))
+    if not m or not _SHA.match(commit_sha or ""):
+        return None
+    try:
+        r = requests.get(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}/git/trees/{commit_sha}",
+                         params={"recursive": "1"}, timeout=timeout, allow_redirects=False,
+                         headers={"Accept": "application/vnd.github+json", "User-Agent": "Codeskys-Deploy"})
+        if r.status_code != 200:
+            return None
+        body = r.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if body.get("truncated"):
+        return None
+    return {e["path"] for e in body.get("tree", []) if e.get("type") == "blob" and isinstance(e.get("path"), str)}
+
+
+def entrypoint_problem(project, settings: dict, files) -> str:
+    """Why the preset's commands cannot work in this repository, or "" (unknown counts as fine)."""
+    if files is None:
+        return ""
+    root = (project["root_dir"] or "").strip("/")
+    under = (lambda p: f"{root}/{p}" if root else p)
+    rel = {f[len(root) + 1:] if root else f for f in files if not root or f.startswith(root + "/")}
+    missing = [what for what, paths in required_files(settings.get("install", ""), settings.get("start", ""))
+               if not any(p in rel for p in paths)]
+    if not missing:
+        return ""
+    where = f"the {root}/ folder" if root else "the top level of the repository"
+    msg = [f"This repository does not match the {settings.get('label') or 'selected'} preset: "
+           f"{', '.join(missing)} is not in {where}, so the app could not start."]
+    entries = sorted(p for p in rel if p.count("/") <= 2 and p.rsplit("/", 1)[-1] in ENTRY_NAMES
+                     and not p.startswith(("tests/", "test/")))[:5]
+    if entries:
+        msg.append("Possible entry points: " + ", ".join(under(e) for e in entries) + ".")
+    compose = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} & rel
+    dockerfiles = [p for p in rel if "/" not in p and p.startswith("Dockerfile.")]
+    if compose and (dockerfiles or len(entries) > 1):
+        msg.append("It is a multi-service Docker Compose project; a Codeskys project runs one service.")
+    example = _example_start(settings.get("start", ""), entries)
+    msg.append("Set the Install command, Start command and Port in Project → Settings for the part you want "
+               "to run" + (f" (for example: {example})" if example else "") + ", then deploy again.")
+    return " ".join(msg)
+
+
+def _example_start(start: str, entries) -> str:
+    """The preset's own server pointed at the first entry point found, e.g. uvicorn backend.main:app."""
+    server = (start or "").split(maxsplit=1)[0] if start else ""
+    py = [e for e in entries if e.endswith(".py") and not e.endswith("manage.py")]
+    if server not in ("gunicorn", "uvicorn") or not py:
+        return ""
+    module = py[0][:-3].replace("/", ".")
+    # Only file names are known here, not whether the app is WSGI (Flask) or ASGI (FastAPI).
+    return (f"uvicorn {module}:app --host 0.0.0.0 --port 8000 for a FastAPI app, "
+            f"or gunicorn {module}:app -b 0.0.0.0:8000 for a Flask app")
+

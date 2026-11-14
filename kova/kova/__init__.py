@@ -34,15 +34,32 @@ def create_app(test_config: dict | None = None) -> Flask:
     from .forms import bp as forms_bp
     from .billing import bp as billing_bp
     from .tlsask import bp as tlsask_bp
+    from .uploads import bp as uploads_bp
 
     for blueprint in (auth_bp, status_bp, pages_bp, projects_bp, account_bp, admin_bp, sites_bp,
-                      providers_bp, webhooks_bp, forms_bp, billing_bp, tlsask_bp):
+                      providers_bp, webhooks_bp, forms_bp, billing_bp, tlsask_bp, uploads_bp):
         app.register_blueprint(blueprint)
 
     # Job handlers register themselves on import; the worker needs them loaded.
     from . import engine  # noqa: F401
 
     _start_inline_worker(app)
+
+    # Uploaded files may only be requested by browsers, and the size of a request is capped.
+    app.config["MAX_CONTENT_LENGTH"] = (int(app.config["MAX_UPLOAD_MB"]) + 5) * 1024 * 1024
+
+    @app.before_request
+    def sites_by_host():
+        """<name>.<SITES_DOMAIN> serves that project's site, and nothing else (no dashboard, no API)."""
+        from . import uploads
+        slug = uploads.host_site_slug(app.config)
+        if slug:
+            return uploads.serve_site(slug, request.path)
+        return None
+
+    @app.errorhandler(413)
+    def too_large(_e):
+        return jsonify(error=f"That upload is larger than the {app.config['MAX_UPLOAD_MB']} MB limit."), 413
 
     @app.before_request
     def bearer_token():
@@ -77,6 +94,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.after_request
     def security_headers(resp):
         resp.headers["X-Content-Type-Options"] = "nosniff"
+        if getattr(g, "live_site", False):
+            return resp  # uploaded sites set their own, stricter headers
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Referrer-Policy"] = "same-origin"
         # Razorpay Checkout (script + iframe) is allowed only on the signed-in app shell

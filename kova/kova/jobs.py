@@ -206,6 +206,9 @@ def sweep(conn, app_config):
     from .ratelimit import prune
     prune(conn)
 
+    from .uploads import sweep_files       # lazy: uploads imports engine
+    sweep_files(conn, app_config)
+
     # A build whose job vanished (killed mid-write, or a job that was purged) must not
     # sit in 'building' forever.
     stuck = conn.execute(

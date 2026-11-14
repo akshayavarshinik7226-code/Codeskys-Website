@@ -11,7 +11,8 @@ from . import engine
 from .crypto import secrets_for
 from .auth import current_user, login_required
 from .db import audit, get_db, utcnow
-from .gitinfo import FRAMEWORKS, GitError, inspect_repo, parse_repo
+from .composegen import coolify_reserved
+from .gitinfo import FRAMEWORKS, GitError, clean_root_dir, inspect_repo, parse_repo, resolve_tree
 from .providers import account_for, token_for, token_for_project
 from .ratelimit import rate_limit
 from .security import for_student
@@ -20,6 +21,28 @@ bp = Blueprint("projects", __name__, url_prefix="/api")
 
 SLUG_RE = re.compile(r"[^a-z0-9-]+")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def _env_key_problem(key: str) -> str:
+    """Why a variable name cannot be saved, or "" when it can."""
+    if not ENV_KEY_RE.match(key):
+        return f"\"{key or '(empty)'}\" is not a valid variable name. Use letters, digits and underscores."
+    if coolify_reserved(key):
+        return f"{key} is set by Codeskys itself and cannot be used as a project variable. Choose another name."
+    return ""
+
+
+def _deployable_repo(db, repo: dict):
+    """The repository, with any folder link resolved, if the active engine can build it.
+
+    Returns ``(repo, branch, root_dir)``; branch/root_dir are "" unless the link named them.
+    Raises GitError, so a URL that the engine would refuse never passes validation."""
+    branch = root = ""
+    if repo.get("tree_path"):
+        branch, root = resolve_tree(repo, lookups=current_app.config.get("GIT_LOOKUPS", True))
+    if engine.active_provider(db, current_app.config) == engine.COOLIFY and repo["provider"] != "github":
+        raise GitError("Codeskys builds GitHub repositories. Enter a link like https://github.com/owner/repo.")
+    return repo, branch, root
 HOST_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 MEMORY_RE = re.compile(r"^\d{1,6}[KMG]$")
 CPUS_RE = re.compile(r"^\d{1,3}(\.\d{1,2})?$")
@@ -83,6 +106,7 @@ def _dep_public(d):
         "project_id": d["project_id"],
         # The UI must never present a simulated build as a real one.
         "is_simulated": d["provider"] == engine.SIMULATOR,
+        "is_upload": d["provider"] == engine.STATIC,
     }
 
 
@@ -104,6 +128,7 @@ def _project_public(p, db=None, full=False):
         "primary_domain": primary["hostname"] if primary else None,
         "deploy_count": db.execute("SELECT COUNT(*) AS n FROM deployments WHERE project_id = ?", (p["id"],)).fetchone()["n"],
     }
+    out["source_type"] = p["source_type"]
     out["git_provider"] = p["git_provider"]
     out["is_private"] = bool(p["is_private"])
     out["authorization"] = {
@@ -145,6 +170,8 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
     """
     if project["is_paused"]:
         raise GitError("This project is paused. Resume it in Settings to deploy.")
+    if project["source_type"] == "upload":
+        raise GitError("This project was created from uploaded files. Upload your updated files to redeploy.")
     branch = branch or project["branch"]
     if commit_sha is None:
         if current_app.config.get("GIT_LOOKUPS", True):
@@ -153,6 +180,10 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
         else:
             commit_sha, msg = secrets.token_hex(20), ""
         commit_message = commit_message or msg or f"Deploy {branch}"
+    # A repeated click (or a re-delivered webhook) must not build the same commit twice.
+    same = in_flight(db, project["id"], target, branch, commit_sha)
+    if same is not None:
+        return same
     number = db.execute("SELECT COALESCE(MAX(number), 0) + 1 AS n FROM deployments WHERE project_id = ?",
                         (project["id"],)).fetchone()["n"]
     provider = engine.active_provider(db, current_app.config)
@@ -173,6 +204,14 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
     return dep_id
 
 
+def in_flight(db, project_id, target, branch, commit_sha):
+    """The queued or building deployment of exactly this source, if there is one."""
+    row = db.execute("SELECT id FROM deployments WHERE project_id = ? AND target = ? AND branch = ? "
+                     "AND commit_sha = ? AND status IN ('queued','building') ORDER BY id DESC LIMIT 1",
+                     (project_id, target, branch, commit_sha)).fetchone()
+    return row["id"] if row else None
+
+
 # Backwards-compatible alias used by older call sites.
 _trigger = trigger_deployment
 
@@ -191,9 +230,11 @@ def git_inspect():
     url = request.args.get("url", "")
     try:
         if not current_app.config.get("GIT_LOOKUPS", True):
-            info = parse_repo(url)
-            return jsonify(repo={**info, "default_branch": "main", "branches": ["main"], "framework": "static",
-                                 "reachable": None, "description": ""})
+            info, branch, root = _deployable_repo(get_db(), parse_repo(url))
+            branch = branch or "main"
+            return jsonify(repo={**info, "default_branch": branch, "branches": [branch], "framework": "static",
+                                 "reachable": None, "description": "", "root_dir": root})
+        _deployable_repo(get_db(), parse_repo(url))
         return jsonify(repo=inspect_repo(url))
     except GitError as exc:
         return err(str(exc), 422)
@@ -268,9 +309,15 @@ def create_project():
     user = current_user()
     db = get_db()
     try:
-        repo = parse_repo(data.get("repo_url", ""))
+        repo, link_branch, link_root = _deployable_repo(db, parse_repo(data.get("repo_url", "")))
+        root_dir = clean_root_dir(data.get("root_dir") or link_root)
     except GitError as exc:
         return err(str(exc), 422)
+    env_items = [e for e in (data.get("env") or [])[:200] if isinstance(e, dict)]
+    for env in env_items:
+        key = str(env.get("key", "")).strip()
+        if key and coolify_reserved(key):
+            return err(_env_key_problem(key), 422)
     name = str(data.get("name") or repo["repo"]).strip()[:64]
     if not name:
         return err("Give your project a name.")
@@ -311,7 +358,7 @@ def create_project():
         "git_account_id, git_provider, repo_external_id, is_private, webhook_secret, ttl_hours, limits_memory, limits_cpus) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (user["id"], name, slug, str(data.get("description") or "")[:300], repo["url"], repo["full_name"],
-         str(data.get("branch") or "main").strip()[:100], framework, fields["root_dir"].strip("/"),
+         str(data.get("branch") or link_branch or "main").strip()[:100], framework, root_dir,
          fields["install_command"], fields["build_command"], fields["output_dir"], fields["start_command"], port,
          str(data.get("node_version") or "20.x"), secrets.token_urlsafe(24), now, now,
          account["id"] if account else None, git_provider, str(data.get("repo_external_id") or "")[:64],
@@ -319,7 +366,7 @@ def create_project():
          current_app.config.get("BUILD_MEMORY", "512M"), current_app.config.get("BUILD_CPUS", "0.5")))
     pid = cur.lastrowid
     box = secrets_for(current_app)
-    for env in (data.get("env") or [])[:200]:
+    for env in env_items:
         key = str(env.get("key", "")).strip()
         if ENV_KEY_RE.match(key):
             value = str(env.get("value", ""))[:8000]
@@ -387,6 +434,11 @@ def update_project(slug):
         return err("Name cannot be empty.")
     if "branch" in updates and not updates["branch"]:
         return err("Branch cannot be empty.")
+    if "root_dir" in updates:
+        try:
+            updates["root_dir"] = clean_root_dir(updates["root_dir"])
+        except GitError as exc:
+            return err(str(exc), 422)
     if "framework" in data:
         if data["framework"] not in FRAMEWORKS:
             return err("Unknown framework preset.")
@@ -421,10 +473,13 @@ def update_project(slug):
         return err("Only an administrator can change build resource limits.", 403)
     if "repo_url" in data:
         try:
-            repo = parse_repo(data["repo_url"])
+            repo, link_branch, link_root = _deployable_repo(db, parse_repo(data["repo_url"]))
         except GitError as exc:
             return err(str(exc), 422)
         updates["repo_url"], updates["repo_full_name"] = repo["url"], repo["full_name"]
+        if repo.get("tree_path"):
+            updates.setdefault("branch", link_branch)
+            updates.setdefault("root_dir", link_root)
         if repo["url"] != p["repo_url"]:
             # A different repository must be verified with GitHub again before the
             # next real deployment; the old numeric id is not carried over.
@@ -465,6 +520,8 @@ def delete_project(slug):
             current_app.logger.warning("Coolify delete for project %s: %s", slug, note)
     db.execute("DELETE FROM projects WHERE id = ?", (p["id"],))
     db.commit()
+    from . import uploads
+    uploads.remove_project_files(current_app.config, p["id"])
     audit("project.deleted", actor_id=current_user()["id"], target=slug, ip=request.remote_addr)
     return jsonify(ok=True)
 
@@ -581,7 +638,10 @@ def get_deployment(dep_id):
                             "ORDER BY id LIMIT 2000", (dep_id, after)).fetchall()
     user = get_db().execute("SELECT name FROM users WHERE id = ?", (d["triggered_by"],)).fetchone() \
         if d["triggered_by"] else None
+    ahead = get_db().execute("SELECT COUNT(*) AS n FROM deployments WHERE status IN ('queued','building') "
+                             "AND id < ?", (d["id"],)).fetchone()["n"] if d["status"] in ("queued", "building") else 0
     return jsonify(deployment=_dep_public(d) | {"is_current": p["current_deployment_id"] == d["id"],
+                                                "builds_ahead": ahead,
                                                 "triggered_by": user["name"] if user else None,
                                                 "project_slug": p["slug"], "project_name": p["name"],
                                                 "repo_url": p["repo_url"]},
@@ -846,8 +906,9 @@ def add_env(slug):
     saved = 0
     for item in items[:200]:
         key = str(item.get("key", "")).strip()
-        if not ENV_KEY_RE.match(key):
-            return err(f"\"{key or '(empty)'}\" is not a valid variable name. Use letters, digits and underscores.")
+        problem = _env_key_problem(key)
+        if problem:
+            return err(problem)
         value = str(item.get("value", ""))
         if len(value) > 8000:
             return err(f"{key} is longer than 8,000 characters.")

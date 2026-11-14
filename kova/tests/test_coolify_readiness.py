@@ -97,6 +97,7 @@ class ReadinessTests(ReadinessCase):
         self.assertIn("exited:unhealthy", d["error"])
         self.assertIn(("GET", "/services/svc-123/logs"), [(c["method"], c["path"]) for c in fake.calls])
         self.assertTrue(any("joblib" in line for line in self.logs(d["id"])))
+        self.assertIn("The log above has its output", d["error"])
         row = self.app_conn().execute("SELECT expires_at FROM deployments WHERE id = ?", (d["id"],)).fetchone()
         self.assertFalse(row["expires_at"], "a failed deployment gets no availability window")
         self.assertEqual(self.client.get(f"/internal/tls-ask?domain=web-app.{BASE}").status_code, 404)
@@ -110,6 +111,9 @@ class ReadinessTests(ReadinessCase):
         self.assertTrue(fake.services["svc-123"]["status"].startswith("exited"))
         self.assertFalse(any("Application output" in line for line in self.logs(d["id"])),
                          "Coolify refuses the logs; nothing is invented")
+        self.assertNotIn("The log above has its output", d["error"], "no output was shown, so none is promised")
+        self.assertIn("Its output could not be read", d["error"])
+        self.assertIn("port 3000 on all network interfaces", d["error"])
 
     def test_app_that_starts_then_crash_loops_is_not_live(self):
         fake = FakeCoolify()

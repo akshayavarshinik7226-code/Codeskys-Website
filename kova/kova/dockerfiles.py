@@ -35,7 +35,10 @@ STATIC_PORT = 8080
 
 _PATH = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 _FLAGS = re.compile(r"--(network|security|device)\b", re.I)
-PYTHON_FRAMEWORKS = {"flask", "django"}
+PYTHON_FRAMEWORKS = {"flask", "django", "fastapi"}
+# The server a Python start command names, installed only when the repository did not
+# bring its own (many Flask repositories list Flask but not Gunicorn).
+PYTHON_SERVERS = {"gunicorn": "gunicorn==23.0.0", "uvicorn": "uvicorn[standard]==0.32.1"}
 
 # SPA-friendly static server: unknown paths fall back to index.html, no server tokens.
 # Written inside single quotes so the shell leaves nginx's $uri alone.
@@ -146,6 +149,9 @@ def generate(project) -> tuple[str, int]:
         lines += [f"FROM {PYTHON_IMAGE}", "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1",
                   _run("useradd --create-home --uid 10001 app"), "WORKDIR /app", "COPY --chown=10001:10001 . ."]
         lines += [_run(s["install"])] if s["install"] else []
+        server = s["start"].split(maxsplit=1)[0] if s["start"] else ""
+        if server in PYTHON_SERVERS:
+            lines += [_run(f"python -c 'import {server}' 2>/dev/null || pip install {PYTHON_SERVERS[server]}")]
         lines += ["USER 10001"]
         lines += [_run(s["build"])] if s["build"] else []
     else:

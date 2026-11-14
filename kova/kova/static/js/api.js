@@ -28,7 +28,30 @@ window.Api = (function () {
     }
     return data;
   }
+  // Multipart upload with a progress callback (fetch cannot report upload progress).
+  function upload(path, form, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", path);
+      xhr.setRequestHeader("Accept", "application/json");
+      xhr.setRequestHeader("X-CSRF-Token", csrf);
+      xhr.withCredentials = true;
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+      xhr.onerror = () => reject(new Error("Network error. Check your connection and try again."));
+      xhr.onload = () => {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText); } catch (_) {}
+        if (data && data.csrf) csrf = data.csrf;
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
+        if (xhr.status === 401) { window.location.assign("/login"); return reject(new Error("Your session has expired.")); }
+        const err = new Error((data && data.error) || (xhr.status === 413 ? "That file is too large." : "Upload failed. Please try again."));
+        err.status = xhr.status; err.data = data; reject(err);
+      };
+      xhr.send(form);
+    });
+  }
   return {
+    upload,
     get: (p) => request("GET", p),
     post: (p, b) => request("POST", p, b === undefined ? {} : b),
     patch: (p, b) => request("PATCH", p, b || {}),

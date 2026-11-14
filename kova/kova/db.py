@@ -330,6 +330,13 @@ MIGRATIONS = [
         received_at TEXT NOT NULL
     );
     """,
+    # 7: direct file upload. projects.source_type: 'git' (a repository) or 'upload' (a zip of
+    #    files). deployments.source_dir: where the published site lives, relative to
+    #    <instance>/uploads (empty until the files have been checked and unpacked).
+    """
+    ALTER TABLE projects ADD COLUMN source_type TEXT NOT NULL DEFAULT 'git';
+    ALTER TABLE deployments ADD COLUMN source_dir TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 

@@ -259,6 +259,17 @@ kbd { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius
 .deploy-head { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; }
 .deploy-head > div { padding: 16px 20px; border-left: 1px solid var(--line); min-width: 0; }
 .deploy-head > div:first-child { border-left: 0; }
+/* ---- direct file upload + friendly waiting screen ---- */
+.drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 26px 18px; cursor: pointer; background: var(--surface, transparent); transition: border-color .15s, background .15s; }
+.drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.drop-msg { display: flex; align-items: center; gap: 14px; justify-content: center; text-align: left; }
+.upload-progress { margin-top: 12px; }
+.upload-progress .bar { height: 6px; border-radius: 6px; background: var(--line); overflow: hidden; margin-bottom: 6px; }
+.upload-progress .fill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.hall { display: flex; align-items: center; gap: 16px; padding: 18px 20px; margin: 0 0 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--accent-soft); }
+.hall[hidden] { display: none; }
+.spinner-ring { width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); animation: hallspin .9s linear infinite; flex: none; }
+@keyframes hallspin { to { transform: rotate(360deg); } }
 .steps { display: flex; gap: 0; margin: 18px 0; }
 .step { flex: 1; display: flex; flex-direction: column; gap: 8px; }
 .step .bar { height: 4px; border-radius: 4px; background: var(--line); margin-right: 6px; overflow: hidden; position: relative; }

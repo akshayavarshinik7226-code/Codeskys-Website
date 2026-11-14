@@ -21,6 +21,7 @@ Cancellation crosses process boundaries through the database: the API sets
 import json
 import random
 import secrets
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -36,6 +37,7 @@ from .jobs import enqueue, handler
 
 SIMULATOR = "simulator"
 COOLIFY = "coolify"
+STATIC = "static"  # uploaded files, hosted directly by Codeskys (real)
 
 
 class CoolifyError(RuntimeError):
@@ -284,6 +286,14 @@ def _finish(conn, dep, project, status, url=None, error=None):
     if status == "ready":
         ttl = project["ttl_hours"] or 24
         fields["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=ttl)).isoformat(timespec="seconds")
+        # Free (hobby) projects get ONE window: updating inside it must not extend it.
+        owner = conn.execute("SELECT plan FROM users WHERE id = ?", (project["owner_id"],)).fetchone()
+        if owner is not None and owner["plan"] == "hobby" and project["current_deployment_id"]:
+            live = conn.execute("SELECT expires_at FROM deployments WHERE id = ? AND status = 'ready' "
+                                "AND expires_at IS NOT NULL AND expires_at > ?",
+                                (project["current_deployment_id"], utcnow())).fetchone()
+            if live is not None:
+                fields["expires_at"] = live["expires_at"]
     _set(conn, dep["id"], **fields)
     if status == "ready" and dep["target"] == "production":
         conn.execute("UPDATE projects SET current_deployment_id = ?, updated_at = ? WHERE id = ?",
@@ -499,6 +509,8 @@ def run_deployment(conn, app_config, payload, beat):
     try:
         if dep["provider"] == COOLIFY:
             _run_coolify(conn, app_config, dep, project, beat)
+        elif dep["provider"] == STATIC:
+            _run_static(conn, app_config, dep, project, beat)
         else:
             _run_simulator(conn, app_config, dep, project, beat)
     except Cancelled:
@@ -516,6 +528,9 @@ def run_deployment(conn, app_config, payload, beat):
         note = revoke_authz_deployment(conn, app_config, final, f"build {final['status']}")
         if note:
             _log(conn, dep_id, note, "info", final["status"])
+        if final["provider"] == STATIC:
+            from . import uploads
+            uploads.discard_deployment(conn, app_config, final)
 
 
 @handler("expire")
@@ -539,7 +554,11 @@ def expire_deployment(conn, app_config, payload, beat):
     # Credential first: even if removing the app fails below, it can no longer
     # reach protected Codeskys services.
     revoked = revoke_authz_deployment(conn, app_config, dep, "deployment expired")
-    if is_live and dep["provider"] == COOLIFY and project["provider_ref"]:
+    if dep["provider"] == STATIC:
+        from . import uploads
+        uploads.remove_deployment_files(app_config, dep)
+        note = "Site expired and its files were removed. The link now shows 404."
+    elif is_live and dep["provider"] == COOLIFY and project["provider_ref"]:
         note = teardown_coolify_app(conn, app_config, project)
         still = conn.execute("SELECT provider_ref FROM projects WHERE id = ?", (project["id"],)).fetchone()
         if still and still["provider_ref"] and "Refused" not in note:
@@ -781,6 +800,64 @@ def _run_simulator(conn, app_config, dep, project, beat):
     _finish(conn, dep, project, "ready", url=url)
 
 
+# ---------------------------------------------------------------- static (uploaded files)
+
+def _run_static(conn, app_config, dep, project, beat):
+    """Check, unpack and publish an uploaded zip. Real hosting, no simulation."""
+    from . import uploads
+    dep_id = dep["id"]
+
+    def check():
+        if _cancel_requested(conn, dep_id):
+            raise Cancelled()
+        beat()
+
+    def log(msg, level="info", stage=""):
+        _log(conn, dep_id, msg, level, stage)
+
+    _set(conn, dep_id, stage="initializing")
+    log("Codeskys static hosting: your files are published directly. This is a real deployment.",
+        "info", "initializing")
+    check()
+    zip_path = uploads.staged_zip(app_config, project["id"], dep_id)
+    if not zip_path.is_file():
+        msg = "The uploaded file is missing on the server. Please upload again."
+        log(msg, "error", "error")
+        _finish(conn, dep, project, "failed", error=msg)
+        return
+    _set(conn, dep_id, stage="cloning")
+    log(f"Unpacking {zip_path.stat().st_size / (1024 * 1024):.1f} MB upload…", stage="cloning")
+    check()
+    dest = uploads.site_dir(app_config, project["id"], dep_id)
+    try:
+        root, stats = uploads.unpack(
+            zip_path, dest, max_bytes=int(app_config["MAX_UPLOAD_MB"]) * 1024 * 1024,
+            max_files=int(app_config["MAX_UPLOAD_FILES"]),
+            log=lambda m, level="info": log(m, level, "cloning"))
+    except uploads.UploadError as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        zip_path.unlink(missing_ok=True)
+        log(str(exc), "error", "error")
+        _finish(conn, dep, project, "failed", error=str(exc))
+        return
+    check()
+    _set(conn, dep_id, stage="building")
+    rel_root = root.relative_to(dest).as_posix()
+    log(f"Checked {stats['files']:,} files ({stats['bytes'] / (1024 * 1024):.1f} MB). "
+        f"index.html found{'' if rel_root == '.' else ' in ' + rel_root}.", "success", "building")
+    _set(conn, dep_id, stage="deploying")
+    stored = uploads.upload_root(app_config).resolve()
+    _set(conn, dep_id, source_dir=root.resolve().relative_to(stored).as_posix())
+    zip_path.unlink(missing_ok=True)
+    url = uploads.site_url(app_config, project["slug"])
+    check()
+    ttl = project["ttl_hours"] or 24
+    log(f"Live at {url} (expires in {ttl}h on the free plan)", "success", "ready")
+    fresh = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
+    _finish(conn, fresh, project, "ready", url=url)
+    uploads.cleanup_superseded(conn, app_config, project, keep_dep_id=dep_id)
+
+
 # ---------------------------------------------------------------- coolify
 
 def coolify_refusal(app_config, project) -> str:
@@ -901,9 +978,20 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
     else:
         from . import dockerfiles
         try:
-            dockerfiles.settings(project)                        # fail before Coolify is asked anything
+            build = dockerfiles.settings(project)                # fail before Coolify is asked anything
         except dockerfiles.DockerfileError as exc:
             raise CoolifyError(str(exc)) from None
+        # The preset's commands must fit the repository at this commit (a missing app.py would
+        # otherwise only show up as a crash after a full build).
+        if app_config.get("GIT_LOOKUPS", True):
+            files = buildpolicy.repository_files(project["repo_url"], dep["commit_sha"])
+            problem = buildpolicy.entrypoint_problem(
+                project, build | {"label": FRAMEWORKS[project["framework"]]["name"]}, files)
+            if problem:
+                raise CoolifyError(problem)
+            if files is None:
+                _log(conn, dep_id, "Could not list the repository files to check the start command; "
+                                   "building anyway.", "warn", "provisioning")
         _log(conn, dep_id, f"Building with the Codeskys {FRAMEWORKS[project['framework']]['name']} "
                            "Dockerfile (isolated build, unprivileged container).", stage="provisioning")
     # A credential only when the shared runtime gateway holds it: the app never does.
@@ -1160,22 +1248,38 @@ def verify_app_ready(conn, api, dep, project, url, beat, settings) -> str:
             break
         beat()
         time.sleep(POLL_SECONDS)
-    _copy_app_logs(conn, api, dep_id, project)
+    shown = _copy_app_logs(conn, api, dep_id, project)
+    hint = ("The log above has its output." if shown else
+            "Its output could not be read, so check that the Start command "
+            f"({_start_command(project) or 'from the Dockerfile'}) works in the repository and that the app "
+            f"listens on port {project['port']} on all network interfaces.")
     return (f"The build finished, but the app did not become available within {timeout} seconds "
-            f"({last}). Check that it listens on the expected port; the log above has its output.")
+            f"({last}). {hint}")
 
 
-def _copy_app_logs(conn, api, dep_id, project, lines=40):
-    """The app's own output, so a crash at start-up is visible in the build log."""
+def _start_command(project) -> str:
+    if project["framework"] == "docker":
+        return ""
+    from . import dockerfiles
+    try:
+        return dockerfiles.settings(project)["start"]
+    except dockerfiles.DockerfileError:
+        return ""
+
+
+def _copy_app_logs(conn, api, dep_id, project, lines=40) -> bool:
+    """The app's own output, so a crash at start-up is visible in the build log. True if any was copied."""
     try:
         data = api.app_logs(project["provider_ref"], lines=lines)
     except CoolifyError:
-        return
+        return False
     text = data.get("logs") if isinstance(data, dict) else data
     if isinstance(text, str) and text.strip():
         _log(conn, dep_id, "Application output (last lines):", "warn", "deploying")
         for line in text.strip().splitlines()[-lines:]:
             _log(conn, dep_id, line, "error", "deploying")
+        return True
+    return False
 
 
 def _stop_unready_app(conn, api, dep_id, project):

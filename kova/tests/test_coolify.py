@@ -452,8 +452,17 @@ class CoolifyDeploymentTests(CoolifyCase):
         fake = FakeCoolify()
         with mock.patch("kova.engine.requests.request", side_effect=fake):
             slug = self.create(deploy=False).get_json()["project"]["slug"]
-            for key in ("API_URL", "SERVICE_FQDN_APP", "COOLIFY_URL", "PORT"):
-                self.call("post", f"/api/projects/{slug}/env", {"key": key, "value": "v"})
+            self.assertEqual(self.call("post", f"/api/projects/{slug}/env", {"key": "API_URL", "value": "v"}).status_code, 200)
+            for key in ("SERVICE_FQDN_APP", "COOLIFY_URL", "PORT"):
+                r = self.call("post", f"/api/projects/{slug}/env", {"key": key, "value": "v"})
+                self.assertEqual(r.status_code, 400, f"{key} is refused when it is saved")
+            # Rows saved before that check existed are still never passed to the app.
+            conn = self.app_conn()
+            pid = conn.execute("SELECT id FROM projects WHERE slug = ?", (slug,)).fetchone()[0]
+            for key in ("SERVICE_FQDN_APP", "COOLIFY_URL", "PORT"):
+                conn.execute("INSERT INTO env_vars (project_id, key, value, is_secret, targets, created_at, updated_at) "
+                             "VALUES (?, ?, 'v', 0, 'production,preview', '2026-01-01', '2026-01-01')", (pid, key))
+            conn.commit()
             d = self.wait(self.call("post", f"/api/projects/{slug}/deploy").get_json()["deployment"]["id"])
         self.assertEqual(d["status"], "ready", d)
         env = compose_sent(fake)["services"]["app"]["environment"]

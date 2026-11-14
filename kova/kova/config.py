@@ -134,4 +134,10 @@ def build_config() -> dict:
         # Run the queue worker inside the web process. Convenient for one machine;
         # set to 0 and run `python manage.py worker` separately in production.
         "INLINE_WORKER": os.environ.get("KOVA_INLINE_WORKER", "1") == "1",
+        # Direct file upload (zip). The free-plan ceiling; see uploads.py.
+        "MAX_UPLOAD_MB": int(os.environ.get("KOVA_MAX_UPLOAD_MB", "500")),
+        "MAX_UPLOAD_FILES": int(os.environ.get("KOVA_MAX_UPLOAD_FILES", "20000")),
+        # Wildcard domain for live links, e.g. "apps.codeskys.com" gives
+        # https://<name>.apps.codeskys.com/. Empty = links look like /live/<name>/.
+        "SITES_DOMAIN": os.environ.get("KOVA_SITES_DOMAIN", "").strip().lower().strip("."),
     }

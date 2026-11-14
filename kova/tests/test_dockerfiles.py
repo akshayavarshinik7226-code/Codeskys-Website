@@ -1,4 +1,4 @@
-"""Codeskys-generated Dockerfiles for the 13 framework presets (kova/dockerfiles.py) and
+"""Codeskys-generated Dockerfiles for the 14 framework presets (kova/dockerfiles.py) and
 the inline-Dockerfile check in composegen.assert_safe. Real builds of each framework are
 in forgeops ops/engine/framework_build_test.sh."""
 import json
@@ -24,8 +24,8 @@ def doc_with(inline):
 
 
 class Generation(unittest.TestCase):
-    def test_all_thirteen_framework_presets_generate_a_valid_dockerfile(self):
-        self.assertEqual(len(FRAMEWORK_IDS), 13)
+    def test_all_fourteen_framework_presets_generate_a_valid_dockerfile(self):
+        self.assertEqual(len(FRAMEWORK_IDS), 14)
         for fw in FRAMEWORK_IDS:
             with self.subTest(fw=fw):
                 text, port = dockerfiles.generate({"framework": fw})
@@ -36,6 +36,19 @@ class Generation(unittest.TestCase):
                 self.assertEqual(port, 8080 if FRAMEWORKS[fw]["static"] else FRAMEWORKS[fw]["port"])
                 users = [l for l in text.splitlines() if l.startswith("USER ")]
                 self.assertTrue(users and users[-1] != "USER root", "the runtime never runs as root")
+
+    def test_python_server_is_installed_only_when_the_repository_lacks_it(self):
+        # A Flask repository often lists Flask but not Gunicorn: the start command must still work.
+        for fw, server in (("flask", "gunicorn"), ("django", "gunicorn"), ("fastapi", "uvicorn")):
+            with self.subTest(fw=fw):
+                text, _ = dockerfiles.generate({"framework": fw})
+                line = next(l for l in text.splitlines() if f"import {server}" in l)
+                self.assertIn(f"|| pip install {dockerfiles.PYTHON_SERVERS[server]}", line)
+                self.assertLess(text.index(line), text.index("USER 10001"), "installed before dropping root")
+                self.assertEqual(_inline_problem(compose_escape(text)), "")
+                composegen.assert_safe(doc_with(compose_escape(text)))
+        own, _ = dockerfiles.generate({"framework": "flask", "start_command": "python app.py"})
+        self.assertNotIn("pip install gunicorn", own, "a custom start command gets no extra server")
 
     def test_the_projects_node_version_selects_the_image(self):
         for version, image in (("20.x", "node:20-bookworm-slim"), ("18", "node:18-bookworm-slim"),

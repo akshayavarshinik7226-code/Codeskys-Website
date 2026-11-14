@@ -62,7 +62,7 @@
   function statusChip(s) { return '<span class="status ' + s + '"><i></i>' + (STATUS_LABEL[s] || s) + "</span>"; }
   function fwLogo(fw, cls) {
     const letters = { nextjs: "N", react: "⚛", cra: "⚛", vue: "V", nuxt: "N", svelte: "S", angular: "A", astro: "A",
-      gatsby: "G", node: "⬡", flask: "Fl", django: "Dj", docker: "D", static: "{}" };
+      gatsby: "G", node: "⬡", flask: "Fl", fastapi: "Fa", django: "Dj", docker: "D", static: "{}" };
     return '<span class="fw-logo fw-' + fw + " " + (cls || "") + '">' + (letters[fw] || "{}") + "</span>";
   }
 
@@ -594,19 +594,105 @@
     K.setNav("projects");
     K.setCrumbs([{ label: "Projects", href: "#/projects" }, { label: "New project" }]);
     const fw = (await Api.get("/api/frameworks")).frameworks;
-    const tab = ["templates", "connected"].includes(params.tab) ? params.tab : "import";
-    const head = K.pageHead("Start a new project", "Import a Git repository or begin from a template. Codeskys detects the framework and sets sensible build defaults.");
+    const tab = ["templates", "connected", "upload"].includes(params.tab) ? params.tab : "import";
+    const head = K.pageHead("Start a new project", "Upload your website files, import a Git repository, or begin from a template.");
     const tabs = el("div", "tabs");
     const tConn = el("a", tab === "connected" ? "on" : "", "My repositories"); tConn.href = "#/new?tab=connected";
     const tImport = el("a", tab === "import" ? "on" : "", "Paste a URL"); tImport.href = "#/new";
     const tTpl = el("a", tab === "templates" ? "on" : "", "Templates"); tTpl.href = "#/new?tab=templates";
-    tabs.append(tConn, tImport, tTpl);
+    const tUp = el("a", tab === "upload" ? "on" : "", "Upload files"); tUp.href = "#/new?tab=upload";
+    tabs.append(tUp, tConn, tImport, tTpl);
     const wrap = el("div");
     setView(view(head, tabs, wrap));
     if (tab === "templates") renderTemplates(wrap, fw);
+    else if (tab === "upload") renderUpload(wrap);
     else if (tab === "connected") renderConnected(wrap, fw);
     else renderImport(wrap, fw, params.repo, params.private === "1");
   });
+
+  // ---------------------------------------------------------------- FILE UPLOAD
+  function fmtBytes(n) { return n < 1048576 ? Math.max(1, Math.round(n / 1024)) + " KB" : (n / 1048576).toFixed(1) + " MB"; }
+
+  // A drag-and-drop zip chooser shared by "new project" and "upload new version".
+  function zipPicker() {
+    const box = el("label", "drop");
+    const input = el("input"); input.type = "file"; input.accept = ".zip,application/zip"; input.hidden = true;
+    const msg = el("div", "drop-msg");
+    box.append(input, msg);
+    let file = null;
+    function show() {
+      msg.innerHTML = file
+        ? svg("check") + "<div><b>" + esc(file.name) + "</b><div class='muted small'>" + fmtBytes(file.size) + " · click to choose a different file</div></div>"
+        : svg("upload") + "<div><b>Drop your .zip here</b><div class='muted small'>or click to choose a file</div></div>";
+    }
+    function set(f) {
+      if (f && !f.name.toLowerCase().endsWith(".zip")) { toast("Only .zip files can be uploaded.", "error"); return; }
+      file = f || null; show();
+    }
+    input.onchange = () => set(input.files[0]);
+    ["dragenter", "dragover"].forEach((ev) => box.addEventListener(ev, (e) => { e.preventDefault(); box.classList.add("over"); }));
+    ["dragleave", "drop"].forEach((ev) => box.addEventListener(ev, (e) => { e.preventDefault(); box.classList.remove("over"); }));
+    box.addEventListener("drop", (e) => set(e.dataTransfer.files[0]));
+    show();
+    return { node: box, file: () => file };
+  }
+
+  function progressBar() {
+    const wrap = el("div", "upload-progress"); wrap.hidden = true;
+    const bar = el("div", "bar"); const fill = el("div", "fill"); bar.append(fill);
+    const txt = el("div", "muted small"); wrap.append(bar, txt);
+    return { node: wrap, set(f) { wrap.hidden = false; fill.style.width = Math.round(f * 100) + "%"; txt.textContent = f < 1 ? "Uploading… " + Math.round(f * 100) + "%" : "Upload complete — starting your build…"; } };
+  }
+
+  function renderUpload(wrap) {
+    const card = el("div", "card card-pad");
+    card.innerHTML = "<h3 style='margin:0 0 4px'>Upload your website files</h3>" +
+      "<p class='muted' style='margin:0 0 16px'>Upload a <b>.zip</b> of your finished website — HTML, CSS and JavaScript, or the built <b>dist</b> / <b>build</b> folder of a React, Vue or Vite project. It needs an <b>index.html</b>. Your link goes live in moments.</p>";
+    const nf = el("div", "field"); nf.innerHTML = "<label>Project name</label>";
+    const ni = el("input", "input"); ni.placeholder = "My portfolio"; nf.append(ni);
+    const lf = el("div", "field"); lf.innerHTML = "<label>Link name <span class='muted small'>(optional)</span></label>";
+    const li = el("input", "input mono"); li.placeholder = "rahul-portfolio"; lf.append(li);
+    const hint = el("div", "muted small", "Your link will be built from your project name."); lf.append(hint);
+    li.oninput = () => { hint.textContent = li.value.trim() ? "Your link: …/" + li.value.trim().toLowerCase() : "Your link will be built from your project name."; };
+    const picker = zipPicker(); const prog = progressBar();
+    const go1 = el("button", "btn accent", "Upload & go live");
+    go1.style.marginTop = "14px";
+    go1.onclick = async () => {
+      if (!ni.value.trim()) return toast("Give your project a name.", "error");
+      if (!picker.file()) return toast("Choose a .zip file first.", "error");
+      const form = new FormData();
+      form.append("name", ni.value.trim()); form.append("slug", li.value.trim()); form.append("file", picker.file());
+      spin(go1, "Uploading…");
+      try {
+        const r = await Api.upload("/api/projects/upload", form, prog.set);
+        toast("Files received");
+        go("#/projects/" + r.project.slug + "/deployments/" + r.deployment_id);
+      } catch (e) { toast(e.message, "error"); unspin(go1); }
+    };
+    const ff = el("div", "field"); ff.innerHTML = "<label>Your files</label>"; ff.append(picker.node);
+    card.append(nf, lf, ff, prog.node, go1);
+    wrap.append(card);
+  }
+
+  // Upload a new version of an uploaded project (free projects keep their original 24 hours).
+  function openUploadModal(p) {
+    const b = el("div");
+    b.append(el("p", "muted", "Upload a new .zip to replace your live site. The link stays the same, and the new version appears as soon as it is ready."));
+    const picker = zipPicker(); const prog = progressBar();
+    b.append(picker.node, prog.node);
+    const go1 = el("button", "btn accent", "Upload & update");
+    go1.onclick = async () => {
+      if (!picker.file()) return toast("Choose a .zip file first.", "error");
+      const form = new FormData(); form.append("file", picker.file());
+      spin(go1, "Uploading…");
+      try {
+        const r = await Api.upload("/api/projects/" + p.slug + "/upload", form, prog.set);
+        K.closeLayer(); toast("Files received");
+        go("#/projects/" + p.slug + "/deployments/" + r.deployment.id);
+      } catch (e) { toast(e.message, "error"); unspin(go1); }
+    };
+    openModal({ title: "Upload new files", desc: p.name, body: b, foot: [K.btn("Cancel", { cls: "ghost", onClick: K.closeLayer }), go1] });
+  }
 
   const TEMPLATES = [
     { name: "Next.js Starter", fw: "nextjs", desc: "Full-stack React framework with server rendering and file-based routing.", repo: "https://github.com/vercel/next-learn-starter", tags: ["React", "SSR"] },
@@ -757,7 +843,7 @@
       try {
         const { repo } = await Api.get("/api/git/inspect?url=" + encodeURIComponent(url));
         model.repo = repo; model.framework = repo.framework || "static";
-        model.name = repo.repo; model.branch = repo.default_branch || "main";
+        model.name = repo.repo; model.branch = repo.default_branch || "main"; if (repo.root_dir) model.root_dir = repo.root_dir;
         applyFrameworkDefaults();
         paintDetail(repo);
       } catch (e) { toast(e.message, "error"); }
@@ -906,7 +992,7 @@
     t.style.minWidth = "0"; head.append(t);
     const actions = el("div", "actions");
     actions.append(K.btn("Visit", { cls: "ghost", icon: "external", href: p.production && !p.production.is_simulated ? (p.production.url || "/sites/" + p.slug + "/") : "/sites/" + p.slug + "/" }));
-    actions.append(K.btn("Deploy", { cls: "accent", icon: "rocket", onClick: () => openDeployModal(p) }));
+    actions.append(K.btn(p.source_type === "upload" ? "Upload new files" : "Deploy", { cls: "accent", icon: p.source_type === "upload" ? "upload" : "rocket", onClick: () => openDeployModal(p) }));
     const more = el("button", "icon-btn", svg("dots", "sm")); more.onclick = () => projectDetailMenu(more, p); actions.append(more); head.append(actions);
 
     const layout = el("div", "layout-side project-workspace");
@@ -928,8 +1014,8 @@
 
   function projectDetailMenu(anchor, p) {
     K.dropdown(anchor, [
-      { label: "Deploy now", icon: "rocket", action: () => openDeployModal(p) },
-      { label: "Open repository", icon: "git", action: () => window.open(p.repo_url, "_blank") },
+      { label: p.source_type === "upload" ? "Upload new files" : "Deploy now", icon: p.source_type === "upload" ? "upload" : "rocket", action: () => openDeployModal(p) },
+      ...(p.source_type === "upload" ? [] : [{ label: "Open repository", icon: "git", action: () => window.open(p.repo_url, "_blank") }]),
       { label: p.is_paused ? "Resume project" : "Pause project", icon: p.is_paused ? "play" : "pause", action: () => togglePause(p) },
       { sep: true },
       { label: "Project settings", icon: "settings", action: () => go("#/projects/" + p.slug + "/settings") },
@@ -949,6 +1035,7 @@
       onConfirm: async () => { await Api.del("/api/projects/" + p.slug, { confirm: i.value.trim() }); toast("Project deleted"); go("#/projects"); } });
   }
   function openDeployModal(p) {
+    if (p.source_type === "upload") return openUploadModal(p);
     const b = el("div");
     const g = el("div", "field"); g.innerHTML = "<label>Branch</label>";
     const branch = el("input", "input mono"); branch.value = p.branch; g.append(branch);
@@ -975,7 +1062,7 @@
     const thumb = el("div", "preview-thumb " + (prod ? "" : "empty"));
     if (prod) thumb.innerHTML = "<div class='bar'></div><div class='l1'></div><div class='l2'></div><div class='l3'></div>"; else thumb.textContent = "No production deployment yet";
     shot.append(thumb);
-    if (prod) { const vb = K.btn("Open live site", { cls: "btn block", icon: "external", href: "/sites/" + p.slug + "/" }); vb.style.marginTop = "12px"; shot.append(vb); }
+    if (prod) { const vb = K.btn("Open live site", { cls: "btn block", icon: "external", href: prod.is_upload && prod.url ? prod.url : "/sites/" + p.slug + "/" }); vb.style.marginTop = "12px"; shot.append(vb); }
     card.append(shot);
     const info = el("div", "info");
     const dom = p.primary_domain || p.slug + ".codeskys.com";
@@ -1060,8 +1147,9 @@
       clear(actions);
       if (d.status === "building" || d.status === "queued") actions.append(K.btn("Cancel", { cls: "danger-ghost", icon: "x", onClick: cancelDep }));
       if (d.url && d.status === "ready") actions.append(K.btn("Visit", { cls: "ghost", icon: "external", href: d.url }));
-      if (d.status === "ready" && !d.is_current) actions.append(K.btn("Promote to production", { cls: "accent", icon: "rocket", onClick: promote }));
-      if (["ready", "failed", "cancelled"].includes(d.status)) actions.append(K.btn("Redeploy", { cls: d.status === "ready" && d.is_current ? "accent" : "", icon: "refresh", onClick: redeploy }));
+      if (d.is_upload && ["ready", "failed", "cancelled"].includes(d.status)) actions.append(K.btn("Upload new files", { cls: "accent", icon: "upload", onClick: () => openUploadModal({ slug: a.slug, name: d.project_name }) }));
+      if (d.status === "ready" && !d.is_current && !d.is_upload) actions.append(K.btn("Promote to production", { cls: "accent", icon: "rocket", onClick: promote }));
+      if (!d.is_upload && ["ready", "failed", "cancelled"].includes(d.status)) actions.append(K.btn("Redeploy", { cls: d.status === "ready" && d.is_current ? "accent" : "", icon: "refresh", onClick: redeploy }));
     }
     async function cancelDep() { try { await Api.post("/api/deployments/" + d.id + "/cancel"); toast("Cancelling…"); } catch (e) { toast(e.message, "error"); } }
     async function promote() { try { const r = await Api.post("/api/deployments/" + d.id + "/promote"); toast(r.mode === "instant" ? "Promoted to production" : "Rebuilding for production"); if (r.mode === "rebuild") go("#/projects/" + a.slug + "/deployments/" + r.deployment_id); else K.render(); } catch (e) { toast(e.message, "error"); } }
@@ -1084,7 +1172,7 @@
 
     // commit line
     const commitLine = el("div", "card card-pad"); commitLine.style.margin = "16px 0";
-    commitLine.innerHTML = "<div class='row'>" + svg("git") + "<div style='flex:1;min-width:0'><b>" + esc(d.commit_message || "Deploy " + d.branch) + "</b><div class='muted small'><span class='branch'>" + svg("branch", "sm") + esc(d.branch) + "</span>" + (d.triggered_by ? " · by " + esc(d.triggered_by) : "") + "</div></div><a class='link small' href='" + esc(d.repo_url) + "' target='_blank'>View source " + "</a></div>";
+    commitLine.innerHTML = "<div class='row'>" + svg("git") + "<div style='flex:1;min-width:0'><b>" + esc(d.commit_message || "Deploy " + d.branch) + "</b><div class='muted small'><span class='branch'>" + svg("branch", "sm") + esc(d.branch) + "</span>" + (d.triggered_by ? " · by " + esc(d.triggered_by) : "") + "</div></div>" + (d.is_upload ? "" : "<a class='link small' href='" + esc(d.repo_url) + "' target='_blank'>View source </a>") + "</div>";
 
     // steps
     const stepsWrap = el("div", "steps");
@@ -1132,8 +1220,25 @@
     filter.oninput = applyFilter;
     copyBtn.onclick = () => { navigator.clipboard.writeText(allLogs.map((l) => l.line).join("\n")).then(() => toast("Logs copied")); };
 
-    bodyWrap.append(summary, commitLine, stepsWrap, logCard);
-    paintActions(); paintSummary(); paintSteps();
+    // Friendly waiting screen: no queue jargon, just "your project is being built".
+    const hall = el("div", "hall"); hall.hidden = true;
+    const HALL_MSGS = ["Packing your files…", "Checking everything is in place…", "Setting up your live link…", "Almost there…"];
+    let hallTick = 0, hallTimer = null;
+    function paintHall() {
+      const waiting = d.status === "queued" || d.status === "building";
+      hall.hidden = !waiting;
+      clearInterval(hallTimer);
+      if (!waiting) return;
+      const ahead = d.builds_ahead || 0;
+      const sub = d.status === "queued" && ahead > 0
+        ? (ahead === 1 ? "One project is being built just before yours." : ahead + " projects are being built just before yours.") + " This usually takes a minute or two — you can keep this page open."
+        : "This usually takes under a minute.";
+      hall.innerHTML = "<div class='spinner-ring'></div><div><b class='hall-msg'></b><div class='muted small'>" + esc(sub) + "</div></div>";
+      const m = $(".hall-msg", hall); const say = () => { m.textContent = HALL_MSGS[hallTick++ % HALL_MSGS.length]; };
+      say(); hallTimer = setInterval(say, 2400);
+    }
+    bodyWrap.append(hall, summary, commitLine, stepsWrap, logCard);
+    paintActions(); paintSummary(); paintSteps(); paintHall();
     liveBadge.textContent = d.status === "building" || d.status === "queued" ? "● Live" : cap(d.status);
     liveBadge.className = "badge " + (d.status === "ready" ? "live" : d.status === "failed" ? "bad" : d.status === "building" ? "warn" : "");
     appendLogs(logs);
@@ -1143,7 +1248,7 @@
         const r = await Api.get("/api/deployments/" + d.id + "?after=" + lastId);
         d = r.deployment;
         if (r.logs.length) appendLogs(r.logs);
-        paintActions(); paintSummary(); paintSteps();
+        paintActions(); paintSummary(); paintSteps(); paintHall();
         liveBadge.textContent = d.status === "building" || d.status === "queued" ? "● Live" : cap(d.status);
         liveBadge.className = "badge " + (d.status === "ready" ? "live" : d.status === "failed" ? "bad" : d.status === "building" ? "warn" : "");
         if (d.status === "building" || d.status === "queued") logPoll = setTimeout(poll, 1000);
