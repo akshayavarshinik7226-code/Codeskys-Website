@@ -34,7 +34,10 @@ PROVIDERS = {
         # GitHub's "repo" scope would grant WRITE access to every private repository; it is
         # only used if the owner explicitly sets KOVA_GITHUB_OAUTH_SCOPE.
         "scope": "read:user",
-        "docs": "https://github.com/settings/developers",
+        # The Codeskys GitHub App's own Client ID/secret work here too ("user-to-server"):
+        # the token then reaches only repositories the App is installed on, and it expires
+        # after 8 hours with a refresh token (both handled below).
+        "docs": "https://github.com/settings/apps",
     },
     "gitlab": {
         "label": "GitLab",
@@ -100,8 +103,17 @@ def account_for(conn, user_id, provider):
                         (user_id, provider)).fetchone()
 
 
+REFRESH_MARGIN = 300   # seconds: refresh a little before the provider's expiry
+
+
+def _expires_soon(expires_at: str) -> bool:
+    soon = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + REFRESH_MARGIN))
+    return expires_at <= soon
+
+
 def token_for(conn, account_row):
-    """Decrypt an account's access token, refreshing it first when GitLab expired it."""
+    """Decrypt an account's access token, refreshing it first when the provider expired it
+    (GitLab tokens, and GitHub App user tokens, which last 8 hours)."""
     if account_row is None:
         return None
     box = secrets_for(current_app)
@@ -109,22 +121,28 @@ def token_for(conn, account_row):
         token = box.decrypt(account_row["token_cipher"])
     except EncryptionError:
         return None
-    if account_row["provider"] == "gitlab" and account_row["token_expires_at"]:
-        if account_row["token_expires_at"] <= utcnow() and account_row["refresh_cipher"]:
-            try:
-                token = _refresh_gitlab(conn, account_row, box.decrypt(account_row["refresh_cipher"]))
-            except (EncryptionError, requests.RequestException):
-                return None
+    if account_row["token_expires_at"] and _expires_soon(account_row["token_expires_at"]):
+        if not account_row["refresh_cipher"]:
+            return None
+        try:
+            token = _refresh(conn, account_row, box.decrypt(account_row["refresh_cipher"]))
+        except (EncryptionError, requests.RequestException, ValueError):
+            return None
     return token
 
 
-def _refresh_gitlab(conn, account_row, refresh_token):
-    cid, csecret = oauth_config("gitlab")
-    r = requests.post(PROVIDERS["gitlab"]["token"], timeout=15, headers={"Accept": "application/json"}, data={
-        "client_id": cid, "client_secret": csecret, "refresh_token": refresh_token,
-        "grant_type": "refresh_token", "redirect_uri": redirect_uri("gitlab")})
+def _refresh(conn, account_row, refresh_token):
+    provider = account_row["provider"]
+    cid, csecret = oauth_config(provider)
+    form = {"client_id": cid, "client_secret": csecret, "refresh_token": refresh_token,
+            "grant_type": "refresh_token"}
+    if provider == "gitlab":
+        form["redirect_uri"] = redirect_uri("gitlab")
+    r = requests.post(PROVIDERS[provider]["token"], timeout=15, headers={"Accept": "application/json"}, data=form)
     r.raise_for_status()
     data = r.json()
+    if data.get("error") or not data.get("access_token"):   # GitHub answers 200 with an error body
+        raise ValueError(data.get("error_description") or "the refresh was refused")
     box = secrets_for(current_app)
     expires_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
                                time.gmtime(time.time() + int(data.get("expires_in") or 7200)))
@@ -230,7 +248,8 @@ def _exchange_github(cid, csecret, code):
     data = r.json()
     if data.get("error") or not data.get("access_token"):
         raise ValueError(data.get("error_description") or "GitHub did not return an access token.")
-    return data["access_token"], data.get("scope", ""), None, None
+    # An OAuth App token never expires; a GitHub App user token comes with a refresh token.
+    return data["access_token"], data.get("scope", ""), data.get("refresh_token"), data.get("expires_in")
 
 
 def _exchange_gitlab(cid, csecret, code):

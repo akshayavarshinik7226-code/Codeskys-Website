@@ -409,8 +409,18 @@ class CoolifyDeploymentTests(CoolifyCase):
 
     def test_private_repositories_are_refused(self):
         self._connect_github()
+        # Refused when the project is created...
+        r = self.create(is_private=True, deploy=False)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("Private repositories", r.get_json()["error"])
+        # ...and still by the engine, for a project that became private some other way.
+        slug = self.create(deploy=False).get_json()["project"]["slug"]
+        conn = self.app_conn()
+        conn.execute("UPDATE projects SET is_private = 1 WHERE slug = ?", (slug,))
+        conn.commit()
         fake = FakeCoolify()
-        d = self.deploy_with(fake, is_private=True)
+        with mock.patch("kova.engine.requests.request", side_effect=fake):
+            d = self.wait(self.call("post", f"/api/projects/{slug}/deploy").get_json()["deployment"]["id"])
         self.assertEqual(d["status"], "failed")
         self.assertIn("Private repositories", d["error"])
         self.assertEqual(fake.calls, [], "no Coolify service may be created for a refused project")

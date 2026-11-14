@@ -351,6 +351,10 @@ def create_project():
     account = account_for(db, user["id"], git_provider) if git_provider in ("github", "gitlab") else None
     if is_private and account is None:
         return err(f"This repository is private. Connect your {git_provider.title()} account first.", 409)
+    if is_private and engine.active_provider(db, current_app.config) == engine.COOLIFY:
+        # The engine would refuse it at build time (engine.coolify_refusal): say so now.
+        return err(engine.coolify_refusal(current_app.config, {"is_private": 1, "framework": framework,
+                                                               "authz_project_id": "x"}), 422)
 
     cur = db.execute(
         "INSERT INTO projects (owner_id, name, slug, description, repo_url, repo_full_name, branch, framework, root_dir, "
