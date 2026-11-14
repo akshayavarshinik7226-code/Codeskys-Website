@@ -46,7 +46,7 @@ _CPUS = re.compile(r"^\d{1,3}(\.\d{1,2})?$")
 _PATH = re.compile(r"^/[A-Za-z0-9._/-]{1,250}$")
 
 # Platform-controlled names the student's env vars may not set on the app.
-RESERVED = {"CODESKYS_DEPLOYMENT_ID", "CODESKYS_REPOSITORY_ID", "CODESKYS_RUNTIME_URL",
+RESERVED = {"CODESKYS_DEPLOYMENT_ID", "CODESKYS_REPOSITORY_ID", "CODESKYS_RUNTIME_URL", "CODESKYS_RUNTIME_TOKEN",
             "CODESKYS_RUNTIME_SECRET", "CODESKYS_RUNTIME_SECRET_FILE", "AUTHZ_INTERNAL_URL",
             "DATA_API_URL", "PORT"}
 
@@ -355,6 +355,9 @@ def render(doc: dict) -> str:
 
 # Names Coolify treats as "magic" (generated URLs, passwords) or sets itself.
 _COOLIFY_MAGIC = ("SERVICE_", "COOLIFY_")
+# The gateway as seen from an app: a container name on its own network, plain HTTP.
+_RUNTIME_URL = re.compile(r"^http://[a-z0-9-]{1,63}(?::[0-9]{1,5})?$")
+_PLATFORM_ENV = ("PORT", "CODESKYS_RUNTIME_URL", "CODESKYS_RUNTIME_TOKEN")
 _SERVICE_APP_KEYS = {"build", "environment", "expose", "mem_limit", "cpus", "labels", "cap_drop",
                      "security_opt", "pids_limit", "restart", "init", "logging"}
 
@@ -366,8 +369,9 @@ def coolify_reserved(key: str) -> bool:
 
 def generate_service(*, slug: str, deployment: int, app_context: str, port: int = 3000,
                      dockerfile: str = "Dockerfile", dockerfile_inline: str | None = None, env_keys=(),
-                     memory: str = "512M", cpus: str = "0.5") -> dict:
-    """The compose document for one Coolify service: the ``app`` container only."""
+                     memory: str = "512M", cpus: str = "0.5", runtime_url: str = "") -> dict:
+    """The compose document for one Coolify service: the ``app`` container only.
+    ``runtime_url`` (not secret) tells the app where the Codeskys runtime gateway is."""
     slug = _check(_SLUG, slug, "project slug")
     if not isinstance(deployment, int) or deployment < 1:
         raise ComposeError("invalid deployment number")
@@ -385,6 +389,10 @@ def generate_service(*, slug: str, deployment: int, app_context: str, port: int 
         if not coolify_reserved(k):
             env[k] = "${" + k + "}"
     env["PORT"] = str(port)
+    if runtime_url:
+        env["CODESKYS_RUNTIME_URL"] = _check(_RUNTIME_URL, runtime_url, "runtime gateway URL")
+        # The per-deployment workload token: its value is a Coolify environment variable.
+        env["CODESKYS_RUNTIME_TOKEN"] = "${CODESKYS_RUNTIME_TOKEN}"
     return assert_safe_service({"services": {"app": {
         "build": ({"context": app_context, "dockerfile_inline": compose_escape(dockerfile_inline)}
                   if dockerfile_inline else {"context": app_context, "dockerfile": dockerfile}),
@@ -423,13 +431,18 @@ def assert_safe_service(doc: dict) -> dict:
     env = app.get("environment")
     need(isinstance(env, dict) and all(isinstance(k, str) and _ENV_KEY.match(k) and isinstance(v, str)
                                        for k, v in env.items()), "environment")
-    need(not any(k != "PORT" and coolify_reserved(k) for k in env), "reserved environment variable")
+    need(not any(k not in _PLATFORM_ENV and coolify_reserved(k) for k in env), "reserved environment variable")
+    need("CODESKYS_RUNTIME_URL" not in env or _RUNTIME_URL.match(env["CODESKYS_RUNTIME_URL"]),
+         "runtime gateway URL")
+    need(("CODESKYS_RUNTIME_TOKEN" in env) == ("CODESKYS_RUNTIME_URL" in env)
+         and env.get("CODESKYS_RUNTIME_TOKEN", "${CODESKYS_RUNTIME_TOKEN}") == "${CODESKYS_RUNTIME_TOKEN}",
+         "runtime workload token")
     need(isinstance(app.get("expose"), list) and len(app["expose"]) == 1 and str(app["expose"][0]).isdigit(),
          "the app exposes exactly one port")
     return doc
 
 
-def for_service(project, dep, *, env_keys=()) -> dict:
+def for_service(project, dep, *, env_keys=(), runtime_url: str = "") -> dict:
     """Engine wrapper: project/deployment rows -> the Coolify service compose document."""
     from . import dockerfiles
     fw = FRAMEWORKS.get(project["framework"], FRAMEWORKS["static"])
@@ -442,7 +455,7 @@ def for_service(project, dep, *, env_keys=()) -> dict:
         except dockerfiles.DockerfileError as exc:
             raise ComposeError(str(exc)) from None
     return generate_service(slug=project["slug"], deployment=int(dep["id"]), app_context=context, port=port,
-                            dockerfile_inline=inline, env_keys=env_keys,
+                            dockerfile_inline=inline, env_keys=env_keys, runtime_url=runtime_url,
                             memory=project["limits_memory"] or "512M", cpus=project["limits_cpus"] or "0.5")
 
 

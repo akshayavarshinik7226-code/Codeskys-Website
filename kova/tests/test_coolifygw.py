@@ -139,9 +139,16 @@ class CheckTests(unittest.TestCase):
         for item in ({"key": "SERVICE_FQDN_APP", "value": "x"}, {"key": "COOLIFY_URL", "value": "x"},
                      {"key": "CODESKYS_RUNTIME_URL", "value": "x"}, {"key": "BAD-NAME", "value": "x"},
                      {"key": "OK", "value": 1}, {"key": "OK", "value": "x", "is_literal": False},
-                     {"key": "OK", "value": "x", "is_build_time": True}):
+                     {"key": "OK", "value": "x", "is_build_time": True},
+                     {"key": "CODESKYS_RUNTIME_TOKEN", "value": "x"},
+                     {"key": "CODESKYS_RUNTIME_TOKEN", "value": "cwt_" + "a" * 43 + "\nX=1"}):
             with self.subTest(item=item):
                 self.refused("PATCH", f"/services/{UUID}/envs/bulk", {"data": [item]})
+
+    def test_only_a_well_formed_workload_token_passes_as_a_platform_variable(self):
+        from kova import coolifygw
+        coolifygw.check_envs({"data": [{"key": "CODESKYS_RUNTIME_TOKEN", "value": "cwt_" + "a" * 43,
+                                        "is_literal": True}]})
 
 
 class _Upstream(BaseHTTPRequestHandler):

@@ -271,6 +271,30 @@ class CoolifyServiceCompose(unittest.TestCase):
         with self.assertRaises(ComposeError):
             composegen.assert_safe_service(d)
 
+    def test_runtime_gateway_url_is_the_only_platform_variable_and_is_validated(self):
+        env = service_doc(runtime_url="http://coolify-proxy")["services"]["app"]["environment"]
+        self.assertEqual(env, {"API_URL": "${API_URL}", "PORT": "3000", "CODESKYS_RUNTIME_URL": "http://coolify-proxy",
+                               "CODESKYS_RUNTIME_TOKEN": "${CODESKYS_RUNTIME_TOKEN}"})
+        d = service_doc(runtime_url="http://coolify-proxy")
+        d["services"]["app"]["environment"]["CODESKYS_RUNTIME_TOKEN"] = "cwt_literal_value_in_compose"
+        with self.assertRaises(ComposeError):
+            composegen.assert_safe_service(d)
+        d = service_doc()
+        d["services"]["app"]["environment"]["CODESKYS_RUNTIME_TOKEN"] = "${CODESKYS_RUNTIME_TOKEN}"
+        with self.assertRaises(ComposeError):        # only together with the runtime URL
+            composegen.assert_safe_service(d)
+        for bad in ("https://coolify-proxy", "http://x.example.com", "http://gw/path", "http://u@gw", "${SECRET}"):
+            with self.subTest(bad=bad), self.assertRaises(ComposeError):
+                service_doc(runtime_url=bad)
+        d = service_doc(runtime_url="http://coolify-proxy")
+        d["services"]["app"]["environment"]["CODESKYS_RUNTIME_URL"] = "http://evil.example.com"
+        with self.assertRaises(ComposeError):
+            composegen.assert_safe_service(d)
+        d["services"]["app"]["environment"]["CODESKYS_RUNTIME_URL"] = "http://coolify-proxy"
+        d["services"]["app"]["environment"]["CODESKYS_DEPLOYMENT_ID"] = "dep_x"
+        with self.assertRaises(ComposeError):
+            composegen.assert_safe_service(d)
+
     def test_invalid_inputs_are_refused(self):
         for over in ({"slug": "Bad Slug"}, {"deployment": 0}, {"port": 0}, {"memory": "lots"}, {"cpus": "1;rm"},
                      {"env_keys": ["BAD-KEY"]}, {"dockerfile": "../Dockerfile"}):

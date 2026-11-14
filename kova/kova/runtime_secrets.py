@@ -16,17 +16,21 @@ directory nothing is requested from authz, so no credential exists to leak.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import secrets
 import shutil
 from pathlib import Path
 
 _DEP = re.compile(r"^dep_[A-Za-z0-9]{6,28}$")
 
 # Groups that guard platform secrets on the VPS (forgeops ops/vps-http/provision.sh):
-# 0 root, 1998 codeskys-ghkey (GitHub App private key), 1999 codeskys-runtime (the
-# platform's own runtime secret). Student sidecars must never be given one of them.
-PLATFORM_SECRET_GIDS = frozenset({0, 1998, 1999})
+# 0 root, 1996 codeskys-coolifygw (Coolify API token), 1998 codeskys-ghkey (GitHub App
+# private key), 1999 codeskys-runtime (the platform's own runtime secret). Runtime
+# secret readers must never be given one of them.
+PLATFORM_SECRET_GIDS = frozenset({0, 1996, 1998, 1999})
 
 
 class SinkError(RuntimeError):
@@ -92,6 +96,61 @@ def deliver(app_config, dep_id: str, secret: str) -> str:
         raise SinkError(f"could not write the runtime secret file ({exc.__class__.__name__})") from None
     finally:
         os.umask(old)
+    return str(final)
+
+
+_SERVICE_UUID = re.compile(r"^[a-z0-9]{8,64}$")
+WORKLOAD_TOKEN = re.compile(r"^cwt_[A-Za-z0-9_-]{43}$")
+
+
+def new_workload_token() -> tuple[str, str]:
+    """(token, sha256 hex) for one deployment. The token goes to the app as
+    CODESKYS_RUNTIME_TOKEN; only the hash is written to disk. It proves nothing
+    on its own: the gateway also requires the app's own network position."""
+    token = "cwt_" + secrets.token_urlsafe(32)
+    return token, hashlib.sha256(token.encode()).hexdigest()
+
+
+def gateway_enabled(app_config) -> bool:
+    """Coolify deployments get a credential only when the shared runtime gateway
+    (forgeops runtime/gateway.py) reads this secret store."""
+    return enabled(app_config) and bool(app_config.get("RUNTIME_GATEWAY_URL"))
+
+
+def bind(app_config, dep_id: str, service_uuid: str, github_repo_id: int, workload_token_sha256: str) -> str:
+    """Tell the runtime gateway which Coolify service runs this deployment.
+
+    ``binding.json`` (not secret) sits next to the deployment's secret file. The
+    gateway serves a calling app only when its address belongs to that service
+    (codeskys-route-sync's map) AND exactly one deployment is bound to it.
+    """
+    if not _SERVICE_UUID.match(service_uuid or ""):
+        raise SinkError("unexpected service id format")
+    if isinstance(github_repo_id, bool) or not isinstance(github_repo_id, int) or github_repo_id < 1:
+        raise SinkError("invalid repository id")
+    if not re.match(r"^[0-9a-f]{64}$", workload_token_sha256 or ""):
+        raise SinkError("invalid workload token hash")
+    target = _dir(app_config, dep_id)
+    if not (target / "runtime_secret").is_file():
+        raise SinkError("the deployment has no runtime secret")
+    gid = _gid(app_config)
+    body = json.dumps({"service_uuid": service_uuid, "deployment_id": dep_id, "github_repo_id": github_repo_id,
+                       "workload_token_sha256": workload_token_sha256}).encode("utf-8")
+    try:
+        tmp = target / ".binding.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, body)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if gid is not None and hasattr(os, "chown"):
+            os.chown(tmp, -1, gid)
+            os.chmod(tmp, 0o640)
+        final = target / "binding.json"
+        os.replace(tmp, final)
+    except OSError as exc:
+        raise SinkError(f"could not write the deployment binding ({exc.__class__.__name__})") from None
     return str(final)
 
 

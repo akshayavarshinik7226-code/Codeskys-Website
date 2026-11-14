@@ -35,7 +35,7 @@ UNAVAILABLE = "ERR_SERVICE_UNAVAILABLE"
 # Fallbacks when authz sends no message (or an old server's opaque one).
 _FALLBACK = {
     POLICY: "This project is suspended on Codeskys. Contact your administrator.",
-    CRED: "This project's Codeskys authorization is not valid (wrong, revoked, expired or replaced credential).",
+    CRED: "This project's Codeskys authorization is no longer valid. Please contact support.",
     REPO: ("The repository is not this project's registered repository. If it was renamed, "
            "transferred or re-created, ask an administrator to re-register it."),
     AUTH: "Codeskys could not authorize this request.",

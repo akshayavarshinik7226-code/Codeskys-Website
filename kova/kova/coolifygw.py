@@ -147,13 +147,19 @@ def check_service(body, cfg: dict, create: bool) -> None:
         _need(label is None or m.group(1) == label, "the URL must match the compose file's project")
 
 
+def _runtime_token(item) -> bool:
+    """The one Codeskys variable allowed through: the deployment's workload token."""
+    from .runtime_secrets import WORKLOAD_TOKEN
+    return item["key"] == "CODESKYS_RUNTIME_TOKEN" and bool(WORKLOAD_TOKEN.fullmatch(str(item.get("value", ""))))
+
+
 def check_envs(body) -> None:
     _need(isinstance(body, dict) and set(body) == {"data"} and isinstance(body["data"], list)
           and len(body["data"]) <= 200, "body must be {data: [...]}")
     for item in body["data"]:
         _need(isinstance(item, dict) and {"key", "value"} <= set(item) <= _ENV_ITEM, "environment item")
         _need(isinstance(item["key"], str) and _ENV_KEY.match(item["key"])
-              and not coolify_reserved(item["key"]), "environment variable name")
+              and (not coolify_reserved(item["key"]) or _runtime_token(item)), "environment variable name")
         _need(isinstance(item["value"], str) and len(item["value"]) <= 32768, "environment variable value")
         _need(item.get("is_literal", True) is True, "environment values are literal")
 

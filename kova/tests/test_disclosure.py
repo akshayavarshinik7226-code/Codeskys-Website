@@ -154,3 +154,65 @@ class GiveUpDisclosureTests(CoolifyCase):
         self.assertIn("Build gave up after 3 attempts", d["error"])
         for leak in ("coolify", "10.0.1.5", "8080"):
             self.assertNotIn(leak, d["error"].lower())
+
+
+# What the deployment engine (or authz) could say about keys and credentials.
+KEY_BODY = {"message": "No private key found for this server. Add an SSH key (id_ed25519) and validate it; "
+                       "credential check failed for the authz runtime secret."}
+KEY_WORDS = ("private key", "ssh key", "credential", "authz", "runtime secret", "id_ed25519")
+
+
+class KeyLanguageTests(CoolifyCase):
+    """Students never see anything about private keys, secrets or credentials (owner
+    requirement 2026-11-13); administrators keep the original text."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure_coolify(coolify_url="http://coolify:8080")
+
+    def assert_no_key_words(self, text):
+        low = text.lower()
+        for w in KEY_WORDS:
+            self.assertNotIn(w, low)
+
+    def test_a_key_error_reaches_the_student_as_a_plain_message(self):
+        self.as_student()
+        fake = FakeCoolify()
+        fake.fail[("POST", "/services")] = (500, KEY_BODY)
+        d = self.deploy_with(fake)
+        self.assertEqual(d["status"], "failed")
+        full = self.client.get(f"/api/deployments/{d['id']}").get_json()
+        self.assertEqual(full["deployment"]["error"], "Deployment unavailable. Please contact support.")
+        self.assert_no_key_words(json.dumps(full))
+        self.assertNotIn("authz_deployment_id", full["deployment"])
+        notes = self.client.get("/api/notifications").get_data(as_text=True)
+        self.assertIn("notifications", notes)
+        self.assert_no_key_words(notes)
+        # the database keeps the original for administrators
+        self.client.post("/api/auth/logout", headers={"X-CSRF-Token": self.csrf()})
+        self.login(ADMIN[0], ADMIN[2])
+        admin_view = self.client.get(f"/api/deployments/{d['id']}").get_json()
+        self.assertIn("private key", admin_view["deployment"]["error"].lower())
+
+    def test_notifications_stored_before_filtering_are_filtered_on_read(self):
+        self.as_student()
+        conn = self.app_conn()
+        uid = conn.execute("SELECT id FROM users WHERE role != 'admin' ORDER BY id DESC LIMIT 1").fetchone()[0]
+        conn.execute("INSERT INTO notifications (user_id, kind, title, body, link, created_at) "
+                     "VALUES (?, 'deploy', 'Deployment failed', ?, '/', '2026-11-01T00:00:00Z')",
+                     (uid, "Authorization credential dep_abc could not be revoked (authz down)"))
+        conn.commit()
+        notes = self.client.get("/api/notifications").get_json()["notifications"]
+        self.assertEqual(notes[0]["body"], "Deployment unavailable. Please contact support.")
+        self.assert_no_key_words(json.dumps(notes))
+
+    def test_ordinary_build_messages_are_untouched(self):
+        from kova.security import for_student
+        for text in ("SyntaxError: Unexpected token '<' in index.js", "npm ERR! missing script: build",
+                     "Deployment expired.", "The app did not answer on its port within 90 seconds."):
+            with self.subTest(text=text):
+                self.assertEqual(for_student(text), text)
+        for text in ("Load key \"/root/.ssh/id\": invalid format private_key", "-----BEGIN RSA PRIVATE KEY-----",
+                     "AUTHZ_SIGNING_KEY missing", "website key rejected", "runtime gateway refused"):
+            with self.subTest(text=text):
+                self.assertEqual(for_student(text), "Deployment unavailable. Please contact support.")

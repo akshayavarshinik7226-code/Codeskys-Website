@@ -125,7 +125,7 @@ class ClientContractTests(CoolifyCase):
     def test_opaque_banner_messages_are_replaced_with_plain_text(self):
         e = AuthzError(403, authz_client.CRED, "REQ-1", "EXECUTION CONTEXT INITIALIZATION FAILED\n\nThe ...")
         self.assertNotIn("EXECUTION CONTEXT", e.user_message())
-        self.assertIn("not valid", e.user_message())
+        self.assertIn("no longer valid", e.user_message())
 
     def test_legacy_200_denial_and_detail_shapes(self):
         legacy = mock.Mock(return_value=_Resp({"ok": False, "reason": "project_suspended",
@@ -378,6 +378,103 @@ class EngineAuthorizationTests(CoolifyCase):
         self.assertEqual(self.client.get("/api/admin/github/installations/179150342/repositories").status_code, 403)
 
 
+class RuntimeGatewayTests(EngineAuthorizationTests.__base__):
+    """Coolify deployments with the shared runtime gateway (forgeops runtime/gateway.py):
+    the credential goes to the gateway's store only, bound to the app's service."""
+    auto_link = False
+    linked_project = EngineAuthorizationTests.linked_project
+    deploy = EngineAuthorizationTests.deploy
+    everything_recorded = EngineAuthorizationTests.everything_recorded
+    DEP = "dep_abcdef0123456789"
+    UUID = "svcabcdefghij123"
+
+    def setUp(self):
+        super().setUp()
+        self.secret_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.secret_dir, True)
+        self.app.config.update(AUTHZ_URL="http://authz.test:8010", AUTHZ_WEBSITE_KEY=WEBSITE_KEY)
+        self.configure_coolify()
+        self.authz, self.coolify = FakeAuthz(), FakeCoolify()
+        self.router = Router(self.authz, self.coolify)
+
+    def enable(self):
+        self.app.config.update(RUNTIME_SECRET_DIR=self.secret_dir, RUNTIME_GATEWAY_URL="http://coolify-proxy")
+        self.coolify.uuid_prefix = "svcabcdefghij"
+
+    def compose(self):
+        import base64
+        create = next(c for c in self.coolify.calls if (c["method"], c["path"]) == ("POST", "/services"))["json"]
+        return json.loads(base64.b64decode(create["docker_compose_raw"]))
+
+    def test_credential_goes_to_the_gateway_store_bound_to_the_service(self):
+        self.enable()
+        d = self.deploy(self.linked_project())
+        self.assertEqual(d["status"], "ready", d)
+        self.assertEqual(d["authz_deployment_id"], self.DEP)
+        self.assertTrue(any(c["path"] == "/deployments" for c in self.authz.calls))
+        folder = os.path.join(self.secret_dir, self.DEP)
+        with open(os.path.join(folder, "runtime_secret")) as fh:
+            self.assertEqual(fh.read(), RUNTIME_SECRET)
+        envs = [e for c in self.coolify.calls if c["path"].endswith("/envs/bulk") for e in c["json"]["data"]]
+        token = next(e["value"] for e in envs if e["key"] == "CODESKYS_RUNTIME_TOKEN")
+        self.assertRegex(token, r"^cwt_[A-Za-z0-9_-]{43}$")
+        import hashlib
+        with open(os.path.join(folder, "binding.json")) as fh:
+            self.assertEqual(json.load(fh), {"service_uuid": self.UUID, "deployment_id": self.DEP,
+                                             "github_repo_id": 424242,
+                                             "workload_token_sha256": hashlib.sha256(token.encode()).hexdigest()})
+        env = self.compose()["services"]["app"]["environment"]
+        self.assertEqual(env.get("CODESKYS_RUNTIME_URL"), "http://coolify-proxy")
+        self.assertEqual(env.get("CODESKYS_RUNTIME_TOKEN"), "${CODESKYS_RUNTIME_TOKEN}", "a reference, not the value")
+        conn = self.app_conn()
+        stored = " ".join(str(tuple(r)) for t in ("deployments", "deploy_logs", "projects", "audit_log", "env_vars")
+                           for r in conn.execute(f"SELECT * FROM {t}"))
+        self.assertNotIn(token, stored, "the website keeps only the hash, on disk")
+        self.assertFalse({"CODESKYS_DEPLOYMENT_ID", "CODESKYS_RUNTIME_SECRET", "CODESKYS_REPOSITORY_ID"} & set(env))
+        self.assertNotIn(RUNTIME_SECRET, self.everything_recorded(),
+                         "never in the compose file, Coolify envs, the database or the build log")
+        logs = "\n".join(self.logs(d["id"])).lower()
+        for word in ("secret", "token", "gateway", "runtime proxy", "credential"):
+            self.assertNotIn(word, logs, "the build log stays neutral for students")
+
+    def test_without_the_gateway_url_no_credential_is_requested(self):
+        self.app.config.update(RUNTIME_SECRET_DIR=self.secret_dir, RUNTIME_GATEWAY_URL="")
+        d = self.deploy(self.linked_project())
+        self.assertEqual(d["status"], "ready", d)
+        self.assertFalse(any(c["path"] == "/deployments" for c in self.authz.calls))
+        self.assertNotIn("CODESKYS_RUNTIME_URL", self.compose()["services"]["app"]["environment"])
+
+    def test_unlinked_project_gets_no_credential_and_no_runtime_url(self):
+        self.enable()
+        self.as_student()
+        with mock.patch("kova.engine.requests.request", side_effect=self.router):
+            d = self.wait(self.create().get_json()["deployment_id"])
+        self.assertEqual(d["status"], "ready", d.get("error"))
+        self.assertEqual(os.listdir(self.secret_dir), [])
+        self.assertNotIn("CODESKYS_RUNTIME_URL", self.compose()["services"]["app"]["environment"])
+
+    def test_expiry_revokes_and_removes_the_binding(self):
+        from kova import engine
+        self.enable()
+        d = self.deploy(self.linked_project())
+        with mock.patch("kova.engine.requests.request", side_effect=self.router):
+            engine.expire_deployment(self.app_conn(), self.app.config, {"deployment_id": d["id"]},
+                                     lambda *a, **k: True)
+        self.assertEqual(self.authz.revoked, [self.DEP])
+        self.assertFalse(os.path.exists(os.path.join(self.secret_dir, self.DEP)))
+
+    def test_a_binding_that_cannot_be_written_fails_closed(self):
+        self.enable()
+        self.coolify.uuid_prefix = "svc-"           # not a Coolify uuid: refused by bind()
+        d = self.deploy(self.linked_project())
+        self.assertEqual(d["status"], "failed")
+        self.assertIn("could not prepare this deployment", d["error"])
+        self.assertEqual(self.authz.revoked, [self.DEP], "the unused credential is revoked")
+        self.assertFalse(os.path.exists(os.path.join(self.secret_dir, self.DEP)))
+        self.assertIn(("DELETE", "/services/svc-123"),
+                      [(c["method"], c["path"]) for c in self.coolify.calls], "the new service is removed")
+
+
 class OwnerLinkTests(EngineAuthorizationTests.__base__):
     def setUp(self):
         super().setUp()
@@ -447,7 +544,7 @@ class RuntimeSecretSinkTests(CoolifyCase):
     def test_refuses_platform_secret_groups(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
-        for gid in ("1998", "1999"):
+        for gid in ("1996", "1998", "1999"):
             with self.subTest(gid=gid), self.assertRaises(runtime_secrets.SinkError):
                 runtime_secrets.deliver({"RUNTIME_SECRET_DIR": d, "RUNTIME_SECRET_GID": gid},
                                         "dep_abcdef012345", "s3cret")

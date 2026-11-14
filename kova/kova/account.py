@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request
 
 from .auth import current_user, login_required
 from .db import audit, get_db, utcnow
-from .security import hash_password, verify_password
+from .security import for_student, hash_password, verify_password
 from .users import MIN_PASSWORD, public_user
 
 bp = Blueprint("account", __name__, url_prefix="/api")
@@ -103,8 +103,10 @@ def notifications():
     uid = current_user()["id"]
     rows = db.execute("SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 100", (uid,)).fetchall()
     unread = db.execute("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0", (uid,)).fetchone()["n"]
-    return jsonify(unread=unread, notifications=[{k: r[k] for k in ("id", "kind", "title", "body", "link", "created_at")}
-                                                 | {"is_read": bool(r["is_read"])} for r in rows])
+    # Rows written before bodies were filtered on insert are filtered here as well.
+    return jsonify(unread=unread, notifications=[{k: r[k] for k in ("id", "kind", "title", "link", "created_at")}
+                                                 | {"body": for_student(r["body"]), "is_read": bool(r["is_read"])}
+                                                 for r in rows])
 
 
 @bp.post("/notifications/read")

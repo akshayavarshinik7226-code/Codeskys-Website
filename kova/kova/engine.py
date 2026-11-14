@@ -30,7 +30,7 @@ import requests
 from . import authz_client, buildpolicy, runtime_secrets
 from .db import get_setting, utcnow
 from .crypto import Secrets
-from .security import redact
+from .security import for_student, redact
 from .gitinfo import FRAMEWORKS, latest_commit
 from .jobs import enqueue, handler
 
@@ -254,7 +254,7 @@ def _set(conn, dep_id, **fields):
 def _notify(conn, user_id, kind, title, body, link):
     if user_id:
         conn.execute("INSERT INTO notifications (user_id, kind, title, body, link, created_at) VALUES (?,?,?,?,?,?)",
-                     (user_id, kind, title, body, link, utcnow()))
+                     (user_id, kind, title, for_student(body), link, utcnow()))
         conn.commit()
 
 
@@ -369,15 +369,12 @@ def authorize_deployment(conn, app_config, dep, project, with_credential=True):
             registered = (state.get("repository") or {}).get("github_repo_id")
             if project["github_repo_id"] and registered is not None and int(registered) != int(repo_id):
                 raise authz_client.AuthzError(403, authz_client.REPO)
-            _log(conn, dep["id"], "Repository authorized. Protected Codeskys services are not available to "
-                                  "live deployments yet (the engine cannot keep a runtime sidecar's network "
-                                  "away from the app), so no deployment credential was requested.",
-                 "warn", "provisioning")
+            _log(conn, dep["id"], "Repository verified. Protected Codeskys services are not enabled on this "
+                                  "server, so the app runs without them.", "warn", "provisioning")
             return []
         if not runtime_secrets.enabled(app_config):
-            _log(conn, dep["id"], "Repository authorized. Protected Codeskys services are not wired to this "
-                                  "engine yet (no runtime-proxy sidecar), so no deployment credential was "
-                                  "requested.", "warn", "provisioning")
+            _log(conn, dep["id"], "Repository verified. Protected Codeskys services are not enabled on this "
+                                  "server, so the app runs without them.", "warn", "provisioning")
             return []
         out = client.create_deployment(pid, repo_id, dep["commit_sha"])
     except authz_client.AuthzError as exc:
@@ -393,10 +390,10 @@ def authorize_deployment(conn, app_config, dep, project, with_credential=True):
         runtime_secrets.deliver(app_config, dep_ref, secret)
     except runtime_secrets.SinkError as exc:
         del secret
-        _log(conn, dep["id"], f"Could not hand the deployment credential to the runtime proxy: {exc}",
+        _log(conn, dep["id"], f"Could not prepare protected Codeskys services ({exc.__class__.__name__}).",
              "error", "provisioning")
-        raise AuthorizationRefused("Codeskys could not prepare this deployment's credential. "
-                                   "Try again; if it keeps failing, contact an administrator.") from None
+        raise AuthorizationRefused("Codeskys could not prepare this deployment. "
+                                   "Try again; if it keeps failing, please contact support.") from None
     del secret
     # authz superseded the project's earlier deployments; drop their secret files.
     for prev in conn.execute("SELECT * FROM deployments WHERE project_id = ? AND id != ? "
@@ -405,9 +402,8 @@ def authorize_deployment(conn, app_config, dep, project, with_credential=True):
         runtime_secrets.discard(app_config, prev["authz_deployment_id"])
         conn.execute("UPDATE deployments SET authz_revoked_at = ? WHERE id = ?", (utcnow(), prev["id"]))
     conn.commit()
-    _log(conn, dep["id"], f"Deployment credential {dep_ref} issued (expires {out.get('expires_at', '?')}) "
-                          "and handed to the runtime proxy as a secret file. It is not stored by the website.",
-         "success", "provisioning")
+    _log(conn, dep["id"], f"Repository verified. Protected Codeskys services enabled for this deployment "
+                          f"(reference {dep_ref}).", "success", "provisioning")
     is_preview = dep["target"] == "preview"
     env = [{"key": "CODESKYS_DEPLOYMENT_ID", "value": dep_ref, "is_preview": is_preview},
            {"key": "CODESKYS_REPOSITORY_ID", "value": str(repo_id), "is_preview": is_preview}]
@@ -442,6 +438,10 @@ def _revoke_remote(app_config, dep_ref: str, reason: str):
             raise RuntimeError(exc.describe()) from None
 
 
+# Marks the note of a revocation authz has not confirmed yet (callers look for it).
+REVOKE_PENDING = "confirmation will be retried automatically"
+
+
 def revoke_authz_deployment(conn, app_config, dep, reason: str) -> str:
     """Revoke a deployment's credential. Idempotent; never raises.
 
@@ -458,11 +458,11 @@ def revoke_authz_deployment(conn, app_config, dep, reason: str) -> str:
         _revoke_remote(app_config, dep_ref, reason)
     except RuntimeError as exc:
         schedule_revoke_retry(conn, dep_ref, dep["id"], reason)
-        return (f"Authorization credential {dep_ref} could not be revoked ({exc}); its secret file was "
-                "destroyed and the revocation will be retried automatically.")
+        return (f"Protected Codeskys services were switched off for this deployment; the {REVOKE_PENDING} "
+                f"(reference {dep_ref}).")
     conn.execute("UPDATE deployments SET authz_revoked_at = ? WHERE id = ?", (utcnow(), dep["id"]))
     conn.commit()
-    return f"Authorization credential {dep_ref} revoked."
+    return f"Protected Codeskys services disabled (reference {dep_ref})."
 
 
 def revoke_project_credentials(conn, app_config, project_id, reason: str) -> list:
@@ -707,7 +707,7 @@ def retry_revoke(conn, app_config, payload, beat):
     if row is not None:
         conn.execute("UPDATE deployments SET authz_revoked_at = ? WHERE id = ?", (utcnow(), row["id"]))
         conn.commit()
-        _log(conn, row["id"], f"Authorization credential {dep_ref} revoked (retry).", "info", row["status"])
+        _log(conn, row["id"], f"Protected Codeskys services disabled (reference {dep_ref}, retry).", "info", row["status"])
 
 
 # ---------------------------------------------------------------- simulator
@@ -906,14 +906,18 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
             raise CoolifyError(str(exc)) from None
         _log(conn, dep_id, f"Building with the Codeskys {FRAMEWORKS[project['framework']]['name']} "
                            "Dockerfile (isolated build, unprivileged container).", stage="provisioning")
-    authorize_deployment(conn, app_config, dep, project, with_credential=False)   # raises AuthorizationRefused
+    # A credential only when the shared runtime gateway holds it: the app never does.
+    gateway = runtime_secrets.gateway_enabled(app_config)
+    authorize_deployment(conn, app_config, dep, project, with_credential=gateway)   # raises AuthorizationRefused
     dep = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
     project = conn.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
+    dep_ref = _col(dep, "authz_deployment_id", "") if gateway else ""
     keys = [r["key"] for r in conn.execute(
         "SELECT key FROM env_vars WHERE project_id = ? AND (',' || targets || ',') LIKE ?",
         (project["id"], f"%,{dep['target']},%"))]
     try:
-        doc = composegen.for_service(project, dep, env_keys=keys)
+        doc = composegen.for_service(project, dep, env_keys=keys,
+                                     runtime_url=app_config["RUNTIME_GATEWAY_URL"] if dep_ref else "")
     except composegen.ComposeError as exc:
         raise CoolifyError(f"Could not prepare the deployment: {exc}.") from None
     skipped = sorted({k for k in keys if composegen.coolify_reserved(k)})
@@ -952,7 +956,20 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
             v = box.decrypt(e["value_cipher"]) if e["is_secret"] and e["value_cipher"] else (e["value"] or "")
             # Literal: Coolify must not expand ${...} in a student's value.
             values.append({"key": e["key"], "value": v, "is_literal": True})
+        digest = ""
+        if dep_ref:
+            token, digest = runtime_secrets.new_workload_token()
+            values.append({"key": "CODESKYS_RUNTIME_TOKEN", "value": token, "is_literal": True})
+            del token
         api.bulk_envs(app_uuid, values)
+        if dep_ref:
+            try:
+                runtime_secrets.bind(app_config, dep_ref, app_uuid, int(project["github_repo_id"]), digest)
+            except runtime_secrets.SinkError as exc:
+                _log(conn, dep_id, f"Could not prepare protected Codeskys services ({exc}).", "error",
+                     "provisioning")
+                raise CoolifyError("Codeskys could not prepare this deployment. Try again; if it keeps "
+                                   "failing, contact support.") from None
         was_running = _app_running(str(verify_coolify_app(api, app_uuid, project, doc).get("status") or ""))
         beat()
         if _cancel_requested(conn, dep_id):

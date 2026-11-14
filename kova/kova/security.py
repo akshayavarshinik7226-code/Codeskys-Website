@@ -50,5 +50,26 @@ def redact(text) -> str:
     return text
 
 
+# How Codeskys protects itself (keys, secrets, credentials, internal services) is never
+# shown to students, not even as an error: an upstream message that mentions it (for
+# example the deployment engine's SSH "private key" errors) is replaced as a whole.
+# Administrators keep the original text (it stays in the database unchanged).
+_INTERNAL = re.compile(
+    r"(?i)private[\s_-]*key|ssh[\s_-]*key|-----BEGIN|\bpem\b|signing[\s_-]*(?:key|secret)|"
+    r"encryption[\s_-]*key|secret[\s_-]*(?:file|key|token)|runtime[\s_-]*secret|credential|"
+    r"\bauthz\b|forgeops|runtime[\s_-]*(?:proxy|gateway)|\bsidecar\b|introspect|"
+    r"(?:website|internal|admin|data[\s_-]*api)[\s_-]*key|api[\s_-]*token|access[\s_-]*token")
+STUDENT_UNAVAILABLE = "Deployment unavailable. Please contact support."
+
+
+def for_student(text, fallback: str = STUDENT_UNAVAILABLE):
+    """Text a student may see: infrastructure details redacted, and anything about
+    keys, secrets or internal services replaced by a plain message."""
+    if text is None or text == "":
+        return text
+    text = redact(text)
+    return fallback if _INTERNAL.search(text) else text
+
+
 # Used to keep login timing similar when the email does not exist.
 DUMMY_HASH = hash_password("not-a-real-password")

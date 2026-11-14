@@ -14,6 +14,7 @@ from .db import audit, get_db, utcnow
 from .gitinfo import FRAMEWORKS, GitError, inspect_repo, parse_repo
 from .providers import account_for, token_for, token_for_project
 from .ratelimit import rate_limit
+from .security import for_student
 
 bp = Blueprint("projects", __name__, url_prefix="/api")
 
@@ -57,15 +58,29 @@ def _load_project(slug):
     return row
 
 
+def _is_admin() -> bool:
+    user = current_user()
+    return bool(user) and user["role"] == "admin"
+
+
 def _dep_public(d):
+    """A deployment as its owner sees it. Error and expiry notes pass through
+    :func:`kova.security.for_student` (no keys, secrets or internal services);
+    administrators get the original text and the authorization reference."""
     if d is None:
         return None
-    return {k: d[k] for k in ("id", "number", "status", "stage", "target", "branch", "commit_sha", "commit_message",
-                              "trigger", "url", "provider", "error", "created_at", "started_at", "finished_at",
-                              "duration_ms", "expires_at", "expired_at", "teardown_note")} | {
+    admin = _is_admin()
+    out = {k: d[k] for k in ("id", "number", "status", "stage", "target", "branch", "commit_sha", "commit_message",
+                             "trigger", "url", "provider", "error", "created_at", "started_at", "finished_at",
+                             "duration_ms", "expires_at", "expired_at", "teardown_note")}
+    if not admin:
+        out["error"] = for_student(out["error"])
+        out["teardown_note"] = for_student(out["teardown_note"], "Deployment expired.")
+    else:
+        out |= {"authz_deployment_id": d["authz_deployment_id"] or None,
+                "credential_revoked": bool(d["authz_revoked_at"])}
+    return out | {
         "project_id": d["project_id"],
-        "authz_deployment_id": d["authz_deployment_id"] or None,
-        "credential_revoked": bool(d["authz_revoked_at"]),
         # The UI must never present a simulated build as a real one.
         "is_simulated": d["provider"] == engine.SIMULATOR,
     }
@@ -439,10 +454,10 @@ def delete_project(slug):
     # Credentials first: even if the app teardown below fails, nothing deployed
     # for this project can reach protected Codeskys services any more.
     notes = engine.revoke_project_credentials(db, current_app.config, p["id"], "project deleted")
-    pending = [n for n in notes if "could not be revoked" in n]
+    pending = [n for n in notes if engine.REVOKE_PENDING in n]
     if pending and not data.get("force"):
-        return err("Codeskys could not revoke this project's deployment credentials, so it was not "
-                   "deleted. Try again shortly, or ask an administrator.", 503)
+        return err("Codeskys could not finish shutting this project down, so it was not deleted. "
+                   "Try again shortly, or please contact support.", 503)
     if p["provider_ref"] and p["provider"] == engine.COOLIFY:
         # Same guard as expiry: only a service Codeskys created for this project is deleted.
         note = engine.teardown_coolify_app(db, current_app.config, p)
@@ -570,7 +585,8 @@ def get_deployment(dep_id):
                                                 "triggered_by": user["name"] if user else None,
                                                 "project_slug": p["slug"], "project_name": p["name"],
                                                 "repo_url": p["repo_url"]},
-                   logs=[dict(r) for r in logs])
+                   logs=[dict(r) for r in logs] if _is_admin() else
+                   [dict(r) | {"line": for_student(r["line"])} for r in logs])
 
 
 @bp.post("/deployments/<int:dep_id>/cancel")

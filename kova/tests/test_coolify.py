@@ -41,6 +41,7 @@ class FakeCoolify:
         self.authz = None                  # FakeAuthz, created on the first authz call
         self.services = {}                 # uuid -> stored state
         self.next_uuid = 123
+        self.uuid_prefix = "svc-"          # real Coolify uuids are 24 lowercase alnum
         self.app_name = app_name           # overrides the stored name in answers (tampering)
         # Status sequence after each start/restart, one per read (the last one repeats).
         self.app_statuses = app_statuses or ["starting:unhealthy", "running:healthy"]
@@ -130,7 +131,7 @@ class FakeCoolify:
             if doc is None:
                 return {"message": "Validation failed.",
                         "errors": {"docker_compose_raw": "The docker_compose_raw should be base64 encoded."}}, 422
-            uuid = f"svc-{self.next_uuid}"
+            uuid = f"{self.uuid_prefix}{self.next_uuid}"
             self.next_uuid += 1
             svc = {"name": body.get("name"), "description": body.get("description"), "compose": text,
                    "containers": list(doc.get("services") or {}), "connect": bool(body.get("connect_to_docker_network")),
@@ -468,8 +469,9 @@ class CoolifyDeploymentTests(CoolifyCase):
         d = self.deploy_with(fake)
         self.assertEqual(d["status"], "ready", d)
         self.assertFalse(any(c["path"] == "/deployments" for c in fake.authz.calls))
-        self.assertFalse(d["authz_deployment_id"])
-        self.assertTrue(any("Protected Codeskys services are not available" in line for line in self.logs(d["id"])))
+        self.assertFalse(self.app_conn().execute("SELECT authz_deployment_id FROM deployments WHERE id = ?",
+                                                 (d["id"],)).fetchone()[0])
+        self.assertTrue(any("Protected Codeskys services are not enabled" in line for line in self.logs(d["id"])))
 
     def _connect_github(self):
         from .test_providers import FakeResponse

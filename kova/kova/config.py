@@ -98,6 +98,10 @@ def build_config() -> dict:
         "RUNTIME_SECRET_DIR": os.environ.get("CODESKYS_RUNTIME_SECRET_DIR", "").strip(),
         # Non-secret URL of the runtime proxy as seen from a deployed app (sidecar).
         "RUNTIME_URL": os.environ.get("CODESKYS_RUNTIME_URL", "").strip().rstrip("/"),
+        # Coolify deployments (Phase 5): the shared runtime gateway as seen from an app,
+        # e.g. http://coolify-proxy. Set together with RUNTIME_SECRET_DIR (the gateway's
+        # read-only secret store) to give Coolify apps protected Codeskys services.
+        "RUNTIME_GATEWAY_URL": os.environ.get("CODESKYS_RUNTIME_GATEWAY_URL", "").strip().rstrip("/"),
         # Member-less group that may read runtime secret files (the sidecar gets it
         # via group_add). Empty = files are owner-only (0600).
         "RUNTIME_SECRET_GID": os.environ.get("CODESKYS_RUNTIME_SECRET_GID", "").strip(),
