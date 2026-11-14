@@ -18,6 +18,7 @@ a restart. Two providers implement the same contract:
 Cancellation crosses process boundaries through the database: the API sets
 ``stage='cancelling'`` and the worker notices on its next checkpoint.
 """
+import hashlib
 import json
 import random
 import secrets
@@ -1051,6 +1052,9 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
             values.append({"key": "CODESKYS_RUNTIME_TOKEN", "value": token, "is_literal": True})
             del token
         api.bulk_envs(app_uuid, values)
+        # A linked app gets a new workload token on every deploy, so its restart must really be
+        # seen: no fingerprint, no fast-restart allowance (see _poll_coolify).
+        _set(conn, dep_id, source_fingerprint="" if dep_ref else source_fingerprint(doc, values))
         if dep_ref:
             try:
                 runtime_secrets.bind(app_config, dep_ref, app_uuid, int(project["github_repo_id"]), digest)
@@ -1098,6 +1102,31 @@ START_GRACE = 90            # seconds Coolify's queue may take to begin a start
 BUILD_TIMEOUT = 60 * 45
 
 
+def source_fingerprint(doc: dict, values) -> str:
+    """sha256 over the compose document and each variable's name + sha256(value): equal only when the
+    app would run exactly the same thing. The per-deployment bookkeeping label is left out. No value
+    is stored or logged."""
+    import copy
+    from . import composegen
+    same = copy.deepcopy(doc)
+    for svc in (same.get("services") or {}).values():
+        (svc.get("labels") or {}).pop("codeskys.deployment", None)
+    h = hashlib.sha256(composegen.render(same).encode("utf-8"))
+    for item in sorted(values, key=lambda v: v["key"]):
+        h.update(b"\0" + item["key"].encode() + b"=" + hashlib.sha256(str(item["value"]).encode()).digest())
+    return h.hexdigest()
+
+
+def _same_as_serving(conn, project, dep_id) -> bool:
+    """True when this deployment would run exactly what the project already serves."""
+    row = conn.execute(
+        "SELECT d.commit_sha, d.source_fingerprint FROM projects p JOIN deployments d ON d.id = p.current_deployment_id "
+        "WHERE p.id = ? AND d.status = 'ready'", (project["id"],)).fetchone()
+    mine = conn.execute("SELECT commit_sha, source_fingerprint FROM deployments WHERE id = ?", (dep_id,)).fetchone()
+    return bool(row and mine and mine["source_fingerprint"] and row["commit_sha"] == mine["commit_sha"]
+                and row["source_fingerprint"] == mine["source_fingerprint"])
+
+
 def _poll_coolify(conn, api, dep, project, remote, domain, beat, settings=None, resumed=False,
                   previous_running=False):
     """Wait for Coolify's build/start (status "starting:…") to end, then check readiness.
@@ -1132,6 +1161,14 @@ def _poll_coolify(conn, api, dep, project, remote, domain, beat, settings=None, 
             break
         elif previous_running:
             if time.time() - begun >= START_GRACE:
+                if _same_as_serving(conn, project, dep_id):
+                    # Same commit, same compose file, same variables as the running version: Coolify
+                    # restarts it in seconds, often between two status updates, so "starting" is never
+                    # seen. Nothing different can be passed off as this build; the readiness check decides.
+                    _log(conn, dep_id, "The app restarted without reporting a start; it runs exactly the same "
+                                       "commit and settings as the running version, so the app itself is checked now.",
+                         stage="deploying")
+                    break
                 _finish(conn, dep, project, "failed",
                         error=f"The new version did not start within {START_GRACE} seconds; the "
                               "previous version is still running. Try again in a few minutes.")

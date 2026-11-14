@@ -374,6 +374,66 @@ class CoolifyDeploymentTests(CoolifyCase):
         self.assertIn("did not start within", d["error"])
         self.assertFalse(d["expires_at"])
 
+    def test_a_same_commit_redeploy_restarts_too_fast_to_see_and_is_still_checked(self):
+        # Production 2026-11-14 (cohackers): Coolify restarted the app in ~2 s, between two status
+        # updates; the redeploy was wrongly failed although the app was up and answering.
+        self.app.config["GIT_LOOKUPS"] = True
+        with mock.patch("kova.engine.resolve_commit", return_value=("f" * 40, "same commit")):
+            fake = FakeCoolify()
+            first = self.deploy_with(fake)
+            self.assertEqual(first["status"], "ready")
+            fake.app_statuses = ["running:healthy"]          # "starting" is never observed
+            with mock.patch("kova.engine.requests.request", side_effect=fake):
+                d = self.wait(self.call("post", "/api/projects/web-app/deploy").get_json()["deployment"]["id"])
+        self.assertEqual(d["status"], "ready", d)
+        self.assertEqual(d["expires_at"], first["expires_at"], "and the redeploy kept the original 24 hours")
+        self.assertTrue(any("same commit and settings as the running version" in line for line in self.logs(d["id"])))
+        self.probe = lambda url, base="": (False, "HTTP 502")    # ...but only if the app really answers
+        fake.app_statuses = ["running:healthy"]
+        with mock.patch("kova.engine.resolve_commit", return_value=("f" * 40, "same commit")), \
+             mock.patch("kova.engine.requests.request", side_effect=fake):
+            bad = self.wait(self.call("post", "/api/projects/web-app/deploy").get_json()["deployment"]["id"])
+        self.assertEqual(bad["status"], "failed")
+
+    def _same_commit_redeploy(self, change=None):
+        self.app.config["GIT_LOOKUPS"] = True
+        with mock.patch("kova.engine.resolve_commit", return_value=("f" * 40, "same commit")):
+            fake = FakeCoolify()
+            self.assertEqual(self.deploy_with(fake)["status"], "ready")
+            if change:
+                change()
+            fake.app_statuses = ["running:healthy"]          # "starting" is never observed
+            with mock.patch("kova.engine.requests.request", side_effect=fake):
+                return self.wait(self.call("post", "/api/projects/web-app/deploy").get_json()["deployment"]["id"])
+
+    def test_same_commit_with_changed_variables_must_really_restart(self):
+        # The old container would still answer the health check: never pass it off as the new settings.
+        d = self._same_commit_redeploy(lambda: self.call("post", "/api/projects/web-app/env",
+                                                         {"key": "API_URL", "value": "https://new.example"}))
+        self.assertEqual(d["status"], "failed")
+        self.assertIn("did not start within", d["error"])
+
+    def test_fingerprint_reflects_compose_and_values_without_storing_them(self):
+        from kova.engine import source_fingerprint
+        def doc(n, cmd="nginx"):
+            return {"services": {"app": {"command": cmd, "labels": {"codeskys.deployment": str(n), "codeskys.role": "app"}}}}
+        base = source_fingerprint(doc(1), [{"key": "A", "value": "secret-1"}])
+        self.assertEqual(base, source_fingerprint(doc(2), [{"key": "A", "value": "secret-1"}]),
+                         "the deployment number label is bookkeeping, not what runs")
+        self.assertNotEqual(base, source_fingerprint(doc(1, "other"), [{"key": "A", "value": "secret-1"}]))
+        self.assertNotEqual(base, source_fingerprint(doc(1), [{"key": "A", "value": "secret-2"}]))
+        self.assertNotEqual(base, source_fingerprint(doc(1), [{"key": "B", "value": "secret-1"}]))
+        self.assertNotIn("secret-1", base)
+        # A real deployment stores only the fingerprint, never a value.
+        slug = self.create(deploy=False).get_json()["project"]["slug"]
+        self.call("post", f"/api/projects/{slug}/env", {"key": "API_URL", "value": "plain-secret-value"})
+        with mock.patch("kova.engine.requests.request", side_effect=FakeCoolify()):
+            d = self.wait(self.call("post", f"/api/projects/{slug}/deploy").get_json()["deployment"]["id"])
+        self.assertEqual(d["status"], "ready", d)
+        fp = self.app_conn().execute("SELECT source_fingerprint FROM deployments WHERE id = ?", (d["id"],)).fetchone()[0]
+        self.assertRegex(fp, r"^[0-9a-f]{64}$")
+        self.assertNotIn("plain-secret-value", fp)
+
     def test_failed_remote_build_is_reported_as_failed(self):
         fake = FakeCoolify(app_statuses=["starting:unhealthy", "exited"])
         d = self.deploy_with(fake)

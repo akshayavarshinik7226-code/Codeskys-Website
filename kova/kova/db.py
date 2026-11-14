@@ -337,6 +337,11 @@ MIGRATIONS = [
     ALTER TABLE projects ADD COLUMN source_type TEXT NOT NULL DEFAULT 'git';
     ALTER TABLE deployments ADD COLUMN source_dir TEXT NOT NULL DEFAULT '';
     """,
+    # 8: what a Coolify deployment actually ran (sha256 of the generated compose file and of each
+    #    variable's value; never the values). '' = unknown, e.g. a linked app with a fresh token.
+    """
+    ALTER TABLE deployments ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 

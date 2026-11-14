@@ -430,6 +430,8 @@ class RuntimeGatewayTests(EngineAuthorizationTests.__base__):
         stored = " ".join(str(tuple(r)) for t in ("deployments", "deploy_logs", "projects", "audit_log", "env_vars")
                            for r in conn.execute(f"SELECT * FROM {t}"))
         self.assertNotIn(token, stored, "the website keeps only the hash, on disk")
+        fp = conn.execute("SELECT source_fingerprint FROM deployments WHERE id = ?", (d["id"],)).fetchone()[0]
+        self.assertEqual(fp, "", "a fresh workload token every deploy: its restart must really be seen")
         self.assertFalse({"CODESKYS_DEPLOYMENT_ID", "CODESKYS_RUNTIME_SECRET", "CODESKYS_REPOSITORY_ID"} & set(env))
         self.assertNotIn(RUNTIME_SECRET, self.everything_recorded(),
                          "never in the compose file, Coolify envs, the database or the build log")
