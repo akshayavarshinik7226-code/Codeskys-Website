@@ -179,5 +179,79 @@ class DuplicateRequestTests(PlatformCase):
         c = self.call("post", f"/api/projects/{slug}/deploy", {"target": "preview"}).get_json()["deployment"]["id"]
         self.assertNotEqual(a, c)
 
+
+class CommitResolutionTests(unittest.TestCase):
+    """A Coolify build is pinned to an exact commit; GitHub's API budget (60/h per server) can run out."""
+    @staticmethod
+    def _pkt(payload: bytes) -> bytes:
+        return b"%04x" % (len(payload) + 4) + payload
+
+    INFO_REFS = (_pkt.__func__(b"# service=git-upload-pack\n") + b"0000"
+                 + _pkt.__func__(b"a" * 40 + b" HEAD\0multi_ack thin-pack symref=HEAD:refs/heads/main\n")
+                 + _pkt.__func__(b"b" * 40 + b" refs/heads/main\n")
+                 + _pkt.__func__(b"c" * 40 + b" refs/heads/feature/login\n")
+                 + b"0000")
+
+    def test_branch_head_reads_git_protocol_refs(self):
+        from kova import gitinfo
+        with mock.patch("kova.gitinfo.requests.get", return_value=_Raw(200, self.INFO_REFS)) as get:
+            self.assertEqual(gitinfo.branch_head("acme/web", "main"), "b" * 40)
+            self.assertEqual(gitinfo.branch_head("acme/web", "feature/login"), "c" * 40)
+            self.assertIsNone(gitinfo.branch_head("acme/web", "nope"))
+        self.assertIn("/acme/web.git/info/refs", get.call_args[0][0])
+        self.assertIsNone(gitinfo.branch_head("../etc", "main"), "names are validated before any request")
+
+    def test_rate_limited_api_falls_back_to_git_protocol(self):
+        from kova import gitinfo
+        def get(url, **kw):
+            return _Raw(403, b"{}") if "api.github.com" in url else _Raw(200, self.INFO_REFS)
+        with mock.patch("kova.gitinfo.requests.get", side_effect=get):
+            self.assertEqual(gitinfo.latest_commit("acme/web", "main")["sha"], "b" * 40)
+
+    def test_platform_token_is_used_for_api_calls_when_set(self):
+        from kova import gitinfo
+        with mock.patch.dict("os.environ", {"KOVA_GITHUB_API_TOKEN": "github_pat_TEST"}),              mock.patch("kova.gitinfo.requests.get", return_value=_Raw(404, b"{}")) as get:
+            gitinfo._gh("/repos/acme/web", 5)
+        self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer github_pat_TEST")
+        with mock.patch.dict("os.environ", {}, clear=True),              mock.patch("kova.gitinfo.requests.get", return_value=_Raw(404, b"{}")) as get:
+            gitinfo._gh("/repos/acme/web", 5)
+        self.assertNotIn("Authorization", get.call_args.kwargs["headers"])
+
+
+class _Raw:
+    def __init__(self, status, content):
+        self.status_code, self.content = status, content
+
+    def json(self):
+        import json
+        return json.loads(self.content or b"{}")
+
+
+class NoPlaceholderCommitTests(CoolifyCase):
+    def setUp(self):
+        super().setUp()
+        self.configure_coolify()
+        self.as_student()
+        self.app.config["GIT_LOOKUPS"] = True
+
+    def test_unknown_branch_creates_the_project_but_no_build(self):
+        with mock.patch("kova.engine.latest_commit", return_value=None):
+            r = self.create(branch="no-such-branch")
+        self.assertEqual(r.status_code, 201)
+        body = r.get_json()
+        self.assertIsNone(body["deployment_id"])
+        self.assertIn("could not find branch 'no-such-branch'", body["deploy_error"])
+        self.assertEqual(self.app_conn().execute("SELECT COUNT(*) FROM deployments").fetchone()[0], 0)
+        with mock.patch("kova.engine.latest_commit", return_value=None):
+            r = self.call("post", f"/api/projects/{body['project']['slug']}/deploy")
+        self.assertEqual(r.status_code, 409)
+
+    def test_resolved_commit_is_the_one_built(self):
+        with mock.patch("kova.engine.latest_commit", return_value={"sha": "e" * 40, "message": "m"}),              mock.patch("kova.engine.enqueue_deploy"):
+            r = self.create()
+        dep = self.app_conn().execute("SELECT commit_sha FROM deployments WHERE id = ?",
+                                      (r.get_json()["deployment_id"],)).fetchone()
+        self.assertEqual(dep[0], "e" * 40)
+
 if __name__ == "__main__":
     unittest.main()

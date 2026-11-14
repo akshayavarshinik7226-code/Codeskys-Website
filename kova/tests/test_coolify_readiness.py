@@ -35,6 +35,27 @@ class ReadinessCase(CoolifyCase):
 
 
 class ExpiryWindowTests(ReadinessCase):
+    def test_a_github_redeploy_keeps_the_original_24_hours(self):
+        # Owner rule (2026-11-14): no redeploy extends the free window: GitHub/Coolify as well as ZIP uploads.
+        fake = FakeCoolify()
+        first = self.deploy(fake)
+        self.assertEqual(first["status"], "ready", first)
+        with mock.patch(PATCH, side_effect=fake):
+            second = self.wait(self.call("post", "/api/projects/web-app/deploy").get_json()["deployment"]["id"])
+        self.assertEqual(second["status"], "ready", second)
+        conn = self.app_conn()
+        e1, e2 = (conn.execute("SELECT expires_at FROM deployments WHERE id = ?", (d["id"],)).fetchone()[0]
+                  for d in (first, second))
+        self.assertEqual(e2, e1, "the redeploy kept the first deployment's expiry")
+        # Once the window has ended, a new deployment starts a new 24 hours.
+        conn.execute("UPDATE deployments SET expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (second["id"],))
+        conn.commit()
+        with mock.patch(PATCH, side_effect=fake):
+            third = self.wait(self.call("post", "/api/projects/web-app/deploy").get_json()["deployment"]["id"])
+        row = conn.execute("SELECT finished_at, expires_at FROM deployments WHERE id = ?", (third["id"],)).fetchone()
+        window = datetime.fromisoformat(row["expires_at"]) - datetime.fromisoformat(row["finished_at"])
+        self.assertAlmostEqual(window.total_seconds(), 24 * 3600, delta=5, msg="fresh window after the old one ended")
+
     def test_window_is_exactly_24_hours_from_the_verified_start_then_the_sweep_ends_it(self):
         from kova import jobs
         fake = FakeCoolify()

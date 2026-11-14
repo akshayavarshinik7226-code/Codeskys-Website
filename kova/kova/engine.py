@@ -315,12 +315,13 @@ def enqueue_deploy(conn, dep_id):
     return enqueue(conn, "deploy", {"deployment_id": dep_id}, dedupe_key=f"deploy:{dep_id}", max_attempts=3)
 
 
-def resolve_commit(project, branch, token=None):
-    """Real head commit when the provider is reachable, else a placeholder."""
+def resolve_commit(project, branch, token=None, exact=False):
+    """Real head commit when the provider is reachable, else a placeholder (simulator only).
+    ``exact``: a real build needs the real commit, so ``(None, "")`` instead of a placeholder."""
     c = latest_commit(project["repo_full_name"], branch, token=token)
     if c:
         return c["sha"], c["message"]
-    return secrets.token_hex(20), ""
+    return (None, "") if exact else (secrets.token_hex(20), "")
 
 
 # ---------------------------------------------------------------- authorization (authz)

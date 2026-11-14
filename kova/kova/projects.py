@@ -173,10 +173,17 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
     if project["source_type"] == "upload":
         raise GitError("This project was created from uploaded files. Upload your updated files to redeploy.")
     branch = branch or project["branch"]
+    provider = engine.active_provider(db, current_app.config)
     if commit_sha is None:
         if current_app.config.get("GIT_LOOKUPS", True):
             token = token_for_project(db, project)
-            commit_sha, msg = engine.resolve_commit(project, branch, token=token)
+            commit_sha, msg = engine.resolve_commit(project, branch, token=token,
+                                                    exact=provider == engine.COOLIFY)
+            if commit_sha is None:
+                # A real build is pinned to an exact commit: never build a made-up one.
+                raise GitError(f"Codeskys could not find branch '{branch}' of {project['repo_full_name']} on "
+                               "GitHub. Check the branch name in Project → Settings and that the repository "
+                               "is public, then deploy again.")
         else:
             commit_sha, msg = secrets.token_hex(20), ""
         commit_message = commit_message or msg or f"Deploy {branch}"
@@ -186,7 +193,6 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
         return same
     number = db.execute("SELECT COALESCE(MAX(number), 0) + 1 AS n FROM deployments WHERE project_id = ?",
                         (project["id"],)).fetchone()["n"]
-    provider = engine.active_provider(db, current_app.config)
     cur = db.execute(
         "INSERT INTO deployments (project_id, number, status, stage, target, branch, commit_sha, commit_message, "
         "trigger, triggered_by, provider, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -383,11 +389,15 @@ def create_project():
     db.commit()
     audit("project.created", actor_id=user["id"], target=slug, ip=request.remote_addr, project_id=pid)
     project = db.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
-    dep_id = None
+    dep_id, deploy_error = None, None
     if data.get("deploy", True):
-        dep_id = trigger_deployment(db, project, trigger="initial", user_id=user["id"])
+        try:
+            dep_id = trigger_deployment(db, project, trigger="initial", user_id=user["id"])
+        except GitError as exc:            # the project exists; the student fixes the branch and deploys
+            deploy_error = str(exc)
         project = db.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
-    return jsonify(project=_project_public(project, db, full=True), deployment_id=dep_id), 201
+    return jsonify(project=_project_public(project, db, full=True), deployment_id=dep_id,
+                   deploy_error=deploy_error), 201
 
 
 def _system_domain(db):

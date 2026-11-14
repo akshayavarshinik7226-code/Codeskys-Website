@@ -62,7 +62,7 @@
   function statusChip(s) { return '<span class="status ' + s + '"><i></i>' + (STATUS_LABEL[s] || s) + "</span>"; }
   function fwLogo(fw, cls) {
     const letters = { nextjs: "N", react: "⚛", cra: "⚛", vue: "V", nuxt: "N", svelte: "S", angular: "A", astro: "A",
-      gatsby: "G", node: "⬡", flask: "Fl", fastapi: "Fa", django: "Dj", docker: "D", static: "{}" };
+      gatsby: "G", node: "⬡", flask: "Fl", fastapi: "Fa", streamlit: "St", django: "Dj", docker: "D", static: "{}" };
     return '<span class="fw-logo fw-' + fw + " " + (cls || "") + '">' + (letters[fw] || "{}") + "</span>";
   }
 
@@ -937,7 +937,8 @@
             start_command: model.start_command, root_dir: model.root_dir, port: model.port || undefined,
             env: model._collectEnv(), deploy: model.deploy };
           const r = await Api.post("/api/projects", payload);
-          toast("Project created");
+          if (r.deploy_error) toast("Project created, but it could not be deployed: " + r.deploy_error, "error");
+          else toast("Project created");
           if (r.deployment_id) go("#/projects/" + r.project.slug + "/deployments/" + r.deployment_id);
           else go("#/projects/" + r.project.slug);
         } catch (e) { toast(e.message, "error"); unspin(create); }

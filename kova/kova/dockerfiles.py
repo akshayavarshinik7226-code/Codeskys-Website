@@ -35,10 +35,11 @@ STATIC_PORT = 8080
 
 _PATH = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 _FLAGS = re.compile(r"--(network|security|device)\b", re.I)
-PYTHON_FRAMEWORKS = {"flask", "django", "fastapi"}
+PYTHON_FRAMEWORKS = {"flask", "django", "fastapi", "streamlit"}
 # The server a Python start command names, installed only when the repository did not
 # bring its own (many Flask repositories list Flask but not Gunicorn).
-PYTHON_SERVERS = {"gunicorn": "gunicorn==23.0.0", "uvicorn": "uvicorn[standard]==0.32.1"}
+PYTHON_SERVERS = {"gunicorn": "gunicorn==23.0.0", "uvicorn": "uvicorn[standard]==0.32.1",
+                  "streamlit": "streamlit==1.40.1"}
 
 # SPA-friendly static server: unknown paths fall back to index.html, no server tokens.
 # Written inside single quotes so the shell leaves nginx's $uri alone.

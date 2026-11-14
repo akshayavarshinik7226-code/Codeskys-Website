@@ -203,9 +203,12 @@ def repository_files(repo_url: str, commit_sha: str, timeout: float = 10.0):
     if not m or not _SHA.match(commit_sha or ""):
         return None
     try:
+        from .gitinfo import api_token
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "Codeskys-Deploy"}
+        if api_token():
+            headers["Authorization"] = f"Bearer {api_token()}"
         r = requests.get(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}/git/trees/{commit_sha}",
-                         params={"recursive": "1"}, timeout=timeout, allow_redirects=False,
-                         headers={"Accept": "application/vnd.github+json", "User-Agent": "Codeskys-Deploy"})
+                         params={"recursive": "1"}, timeout=timeout, allow_redirects=False, headers=headers)
         if r.status_code != 200:
             return None
         body = r.json()
@@ -223,8 +226,11 @@ def entrypoint_problem(project, settings: dict, files) -> str:
     root = (project["root_dir"] or "").strip("/")
     under = (lambda p: f"{root}/{p}" if root else p)
     rel = {f[len(root) + 1:] if root else f for f in files if not root or f.startswith(root + "/")}
-    missing = [what for what, paths in required_files(settings.get("install", ""), settings.get("start", ""))
-               if not any(p in rel for p in paths)]
+    needs = required_files(settings.get("install", ""), settings.get("start", ""))
+    if settings.get("static") and not settings.get("install") and not settings.get("build"):
+        out = (settings.get("output") or "").strip("/")
+        needs.append(("an index.html (the site's home page)", [f"{out}/index.html" if out else "index.html"]))
+    missing = [what for what, paths in needs if not any(p in rel for p in paths)]
     if not missing:
         return ""
     where = f"the {root}/ folder" if root else "the top level of the repository"

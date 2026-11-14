@@ -5,6 +5,7 @@ token for private ones. Tokens are passed in per call — nothing is cached here
 """
 import base64
 import json
+import os
 import re
 from urllib.parse import quote
 
@@ -33,6 +34,7 @@ FRAMEWORKS = {
     "gatsby":   {"name": "Gatsby",          "install": "npm install", "build": "npm run build", "output": "public",  "start": "",            "port": 80,   "static": True},
     "node":     {"name": "Node.js / Express", "install": "npm install", "build": "",            "output": "",        "start": "npm start",   "port": 3000, "static": False},
     "flask":    {"name": "Python (Flask)",  "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "gunicorn app:app -b 0.0.0.0:8000", "port": 8000, "static": False},
+    "streamlit": {"name": "Python (Streamlit)", "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "streamlit run app.py --server.port 8000 --server.address 0.0.0.0 --server.headless true", "port": 8000, "static": False},
     "fastapi":  {"name": "Python (FastAPI)", "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "uvicorn main:app --host 0.0.0.0 --port 8000", "port": 8000, "static": False},
     "django":   {"name": "Python (Django)", "install": "pip install -r requirements.txt", "build": "python manage.py collectstatic --noinput", "output": "", "start": "gunicorn config.wsgi -b 0.0.0.0:8000", "port": 8000, "static": False},
     "docker":   {"name": "Dockerfile",      "install": "",            "build": "",              "output": "",        "start": "",            "port": 3000, "static": False},
@@ -145,6 +147,8 @@ def detect_framework(pkg: dict | None, files: set, requirements: str = "") -> st
     reqs = _requirement_names(requirements)
     if "fastapi" in reqs and "flask" not in reqs:
         return "fastapi"
+    if "streamlit" in reqs and "flask" not in reqs:
+        return "streamlit"
     if "requirements.txt" in files or "app.py" in files:
         return "flask"
     return "static"
@@ -152,8 +156,15 @@ def detect_framework(pkg: dict | None, files: set, requirements: str = "") -> st
 
 # ---------------------------------------------------------------- GitHub
 
+def api_token(token: str | None = None) -> str | None:
+    """The caller's token, else the platform's optional read-only token for public repositories
+    (KOVA_GITHUB_API_TOKEN: 5,000 GitHub API calls an hour instead of 60 for the whole server)."""
+    return token or os.environ.get("KOVA_GITHUB_API_TOKEN", "").strip() or None
+
+
 def _gh(path: str, timeout: float, token: str | None = None):
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "Codeskys-Deploy"}
+    token = api_token(token)
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return requests.get("https://api.github.com" + path, timeout=timeout, headers=headers)
@@ -292,10 +303,45 @@ def latest_commit(full_name: str, branch: str, timeout: float = 6.0, token: str 
                 c = r.json()[0]
                 return {"sha": c["id"], "message": (c.get("title") or "")[:200]}
             return None
-        r = _gh(f"/repos/{full_name}/commits/{branch}", timeout, token)
+        r = _gh(f"/repos/{full_name}/commits/{quote(branch, safe='/')}", timeout, token)
         if r.status_code == 200:
             c = r.json()
             return {"sha": c["sha"], "message": c["commit"]["message"].splitlines()[0][:200]}
     except requests.RequestException:
         pass
+    if provider == "github":
+        # The REST API is limited (60 calls an hour per server without a token) or may be down;
+        # git's own protocol still says where the branch points, without using that budget.
+        sha = branch_head(full_name, branch, timeout)
+        if sha:
+            return {"sha": sha, "message": ""}
+    return None
+
+
+def branch_head(full_name: str, branch: str, timeout: float = 10.0) -> str | None:
+    """The commit a public GitHub branch points to, read like ``git ls-remote`` (smart HTTP)."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name or "") or not branch:
+        return None
+    try:
+        r = requests.get(f"https://github.com/{full_name}.git/info/refs", params={"service": "git-upload-pack"},
+                         headers={"User-Agent": "git/2.43 Codeskys-Deploy"}, timeout=timeout,
+                         allow_redirects=False)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    data, pos, want = r.content[:2_000_000], 0, f"refs/heads/{branch}".encode()
+    while pos + 4 <= len(data):
+        try:
+            size = int(data[pos:pos + 4], 16)
+        except ValueError:
+            return None
+        if size == 0:                       # flush packet
+            pos += 4
+            continue
+        line = data[pos + 4:pos + size].split(b"\0", 1)[0].rstrip(b"\n")
+        pos += size
+        sha, _, ref = line.partition(b" ")
+        if ref == want and re.fullmatch(rb"[0-9a-f]{40}", sha):
+            return sha.decode()
     return None

@@ -80,6 +80,27 @@ class Preflight(unittest.TestCase):
         self.assertEqual(problem("flask", files=None), "")
 
 
+class StaticAndStreamlit(unittest.TestCase):
+    def test_static_site_needs_an_index_html(self):
+        msg = problem("static", files={"README.md", "forgeops-devops (1).zip"})     # the Devops repository
+        self.assertIn("an index.html (the site's home page) is not in the top level", msg)
+        self.assertEqual(problem("static", files={"index.html", "README.md"}), "")   # cohackers
+        self.assertEqual(problem("static", files={"site/index.html"}, root_dir="site"), "")
+        self.assertEqual(problem("static", files={"public/index.html"}, output_dir="public"), "")
+
+    def test_built_frontends_are_not_required_to_ship_index_html(self):
+        self.assertEqual(problem("react", files={"package.json", "src/main.jsx", "index.html"}), "")
+        self.assertEqual(problem("react", files={"package.json", "src/main.jsx"}), "", "built by npm run build")
+
+    def test_streamlit_preset(self):
+        from kova.gitinfo import detect_framework
+        self.assertEqual(detect_framework(None, {"requirements.txt", "app.py"}, "streamlit\npandas\n"), "streamlit")
+        self.assertEqual(problem("streamlit", files={"app.py", "requirements.txt"}), "")
+        self.assertIn("app.py", problem("streamlit", files={"frontend/app.py", "requirements.txt"}))
+        text, port = dockerfiles.generate({"framework": "streamlit"})
+        self.assertEqual(port, 8000)
+        self.assertIn("python -c 'import streamlit' 2>/dev/null || pip install streamlit==1.40.1", text)
+
 class EngineTests(CoolifyCase):
     """The engine refuses before creating anything in Coolify; nothing is built."""
     def setUp(self):

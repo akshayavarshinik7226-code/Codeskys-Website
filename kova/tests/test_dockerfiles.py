@@ -1,4 +1,4 @@
-"""Codeskys-generated Dockerfiles for the 14 framework presets (kova/dockerfiles.py) and
+"""Codeskys-generated Dockerfiles for the 15 framework presets (kova/dockerfiles.py) and
 the inline-Dockerfile check in composegen.assert_safe. Real builds of each framework are
 in forgeops ops/engine/framework_build_test.sh."""
 import json
@@ -24,8 +24,8 @@ def doc_with(inline):
 
 
 class Generation(unittest.TestCase):
-    def test_all_fourteen_framework_presets_generate_a_valid_dockerfile(self):
-        self.assertEqual(len(FRAMEWORK_IDS), 14)
+    def test_all_fifteen_framework_presets_generate_a_valid_dockerfile(self):
+        self.assertEqual(len(FRAMEWORK_IDS), 15)
         for fw in FRAMEWORK_IDS:
             with self.subTest(fw=fw):
                 text, port = dockerfiles.generate({"framework": fw})
