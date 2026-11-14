@@ -11,6 +11,7 @@ Design rules this module exists to enforce:
   provider endpoints.
 """
 import secrets
+import threading
 import time
 from urllib.parse import quote, urlencode
 
@@ -104,6 +105,9 @@ def account_for(conn, user_id, provider):
 
 
 REFRESH_MARGIN = 300   # seconds: refresh a little before the provider's expiry
+# GitHub refresh tokens are single-use: two requests refreshing at once would make the second
+# one fail. One refresh at a time per process (the website runs one process).
+_REFRESH_LOCK = threading.Lock()
 
 
 def _expires_soon(expires_at: str) -> bool:
@@ -122,12 +126,17 @@ def token_for(conn, account_row):
     except EncryptionError:
         return None
     if account_row["token_expires_at"] and _expires_soon(account_row["token_expires_at"]):
-        if not account_row["refresh_cipher"]:
-            return None
-        try:
-            token = _refresh(conn, account_row, box.decrypt(account_row["refresh_cipher"]))
-        except (EncryptionError, requests.RequestException, ValueError):
-            return None
+        with _REFRESH_LOCK:
+            # Another request may have refreshed it meanwhile: use what is stored now.
+            row = conn.execute("SELECT * FROM git_accounts WHERE id = ?", (account_row["id"],)).fetchone()
+            if row is None or not row["refresh_cipher"]:
+                return None
+            try:
+                if row["token_expires_at"] and not _expires_soon(row["token_expires_at"]):
+                    return box.decrypt(row["token_cipher"])
+                token = _refresh(conn, row, box.decrypt(row["refresh_cipher"]))
+            except (EncryptionError, requests.RequestException, ValueError):
+                return None
     return token
 
 

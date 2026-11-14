@@ -103,6 +103,54 @@ class GitHubAppLoginTests(PlatformCase):
         self.assertEqual(r.status_code, 200)
 
 
+    def test_concurrent_requests_refresh_once_with_the_single_use_refresh_token(self):
+        import threading
+        from kova import providers
+        self.connect({"access_token": ACCESS1, "expires_in": 28800, "refresh_token": REFRESH1})
+        conn = connect(self.app.config["DATABASE"])
+        conn.execute("UPDATE git_accounts SET token_expires_at = '2020-01-01T00:00:00+00:00'")
+        conn.commit()
+        stale = conn.execute("SELECT * FROM git_accounts").fetchone()     # what both requests read first
+        calls = []
+
+        def post(url, **kw):
+            calls.append(kw["data"]["refresh_token"])
+            if kw["data"]["refresh_token"] != REFRESH1:                   # GitHub: a used refresh token is dead
+                return FakeResponse({"error": "bad_refresh_token"})
+            return FakeResponse({"access_token": ACCESS2, "expires_in": 28800, "refresh_token": REFRESH2})
+        got = []
+        with self.app.test_request_context(), mock.patch("kova.providers.requests.post", side_effect=post):
+            got.append(providers.token_for(conn, stale))
+            got.append(providers.token_for(conn, stale))                 # second request, same stale row
+        self.assertEqual(got, [ACCESS2, ACCESS2], "the second request uses the token the first one obtained")
+        self.assertEqual(calls, [REFRESH1], "the single-use refresh token was spent exactly once")
+        conn.execute("UPDATE git_accounts SET token_expires_at = '2020-01-01T00:00:00+00:00'")
+        conn.commit()
+        calls.clear()
+        results = []
+
+        def worker():
+            c = connect(self.app.config["DATABASE"])
+            with self.app.test_request_context(), mock.patch("kova.providers.requests.post", side_effect=post):
+                results.append(providers.token_for(c, stale))
+            c.close()
+        # REFRESH2 is the stored one now; make it valid for exactly one refresh in this round.
+        REF = {"current": REFRESH2}
+
+        def post2(url, **kw):
+            calls.append(kw["data"]["refresh_token"])
+            if kw["data"]["refresh_token"] != REF["current"]:
+                return FakeResponse({"error": "bad_refresh_token"})
+            REF["current"] = "spent"
+            return FakeResponse({"access_token": ACCESS1, "expires_in": 28800, "refresh_token": REFRESH1})
+        post = post2
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for th in threads: th.start()
+        for th in threads: th.join()
+        conn.close()
+        self.assertEqual(results, [ACCESS1] * 6, "six parallel requests all get the refreshed token")
+        self.assertEqual(len(calls), 1)
+
 class PrivateRepoTests(CoolifyCase):
     def test_private_repository_is_refused_when_the_project_is_created(self):
         self.configure_coolify()
