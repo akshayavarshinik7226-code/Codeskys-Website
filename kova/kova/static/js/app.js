@@ -53,11 +53,50 @@
     if (!iso) return null;
     const ms = new Date(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z").getTime() - Date.now();
     if (ms <= 0) return "expired";
-    const h = Math.floor(ms / 3600000), m = Math.round((ms % 3600000) / 60000);
+    const total = Math.max(1, Math.floor(ms / 60000));   // whole minutes left, never "60m"
+    const h = Math.floor(total / 60), m = total % 60;
+    if (h >= 48) return `expires in ${Math.floor(h / 24)}d ${h % 24}h`;
     return h >= 1 ? `expires in ${h}h ${m}m` : `expires in ${m}m`;
   }
   function simBadge(dep) {
     return dep && dep.is_simulated ? "<span class='badge warn' title='Built by the Codeskys simulator, not a real server'>Simulated</span>" : "";
+  }
+  // Where visitors reach the project: the live deployment's own URL (https://<slug>.apps.<domain>
+  // for apps, /live/<slug>/ for uploaded sites); the built-in site page only without one.
+  // Paid hosting (₹510): while it runs, the deployments are not limited to 24 hours.
+  function hostingActive(iso) { return !!iso && new Date(iso).getTime() + 24 * 3600000 > Date.now(); }
+  function liveUrl(p) { const d = p && p.production; return d && !d.is_simulated && d.url ? d.url : "/sites/" + p.slug + "/"; }
+  function liveHost(p) { const u = liveUrl(p); return (/^https?:/.test(u) ? u.replace(/^https?:\/\//, "") : (typeof location !== "undefined" ? location.host : "codeskys.com") + u).replace(/\/$/, ""); }
+  function isLifetime(iso) { return !!iso && new Date(iso).getFullYear() >= 2100; }
+  // The address a visitor opens for a project (the real link, whichever way it was published).
+  function liveHref(p) { return liveUrl(p); }
+  function absUrl(u) { return u && u.startsWith("/") ? location.origin + u : u; }
+  function openNew(u) { window.open(u, "_blank", "noopener,noreferrer"); }
+  function shortDate(iso) { return iso ? dateTime(iso) : "—"; }
+  // The one-line plan status shown at the top of a project: how long it stays live, or that the
+  // free period has ended.
+  function planStrip(p) {
+    const a = p.access || {};
+    if (a.admin) return el("div", "callout info", svg("shield") + "<div><b>Administrator account.</b> Free-plan limits and expiry do not apply here, so you can test freely.</div>");
+    if (a.is_free === false) {
+      if (a.lifetime) return el("div", "callout live", svg("check") + "<div><b>Lifetime hosting.</b> Your projects stay live for as long as you keep your account.</div>");
+      if (a.expires_at) return el("div", "callout live", svg("check") + "<div><b>Paid hosting.</b> Your projects stay live until " + esc(dateTime(a.expires_at)) + ".</div>");
+      return null;
+    }
+    if (a.blocked) {
+      const c = el("div", "callout bad plan-strip");
+      c.innerHTML = svg("alert") + "<div><b>Your free 24 hours have ended.</b> This project’s link now shows a 404 page. Upgrade to bring it back online.</div>";
+      c.append(K.btn("Upgrade", { cls: "accent sm", icon: "bolt", href: "#/billing" }));
+      return c;
+    }
+    if (a.expires_at) {
+      const c = el("div", "callout info plan-strip");
+      c.innerHTML = svg("clock") + "<div><b>Free live for 24 hours.</b> Expires <b>" + esc(dateTime(a.expires_at)) + "</b> (" + esc((expiryLabel(a.expires_at) || "").replace("expires ", "")) + "). " +
+        "You can update and redeploy as many times as you like before then; the expiry stays the same.</div>";
+      c.append(K.btn("Upgrade", { cls: "sm", icon: "bolt", href: "#/billing" }));
+      return c;
+    }
+    return el("div", "callout info", svg("clock") + "<div><b>Free plan.</b> Your project goes live for 24 hours as soon as it is published.</div>");
   }
   function statusChip(s) { return '<span class="status ' + s + '"><i></i>' + (STATUS_LABEL[s] || s) + "</span>"; }
   function fwLogo(fw, cls) {
@@ -188,7 +227,9 @@
   }
   function btn(label, { cls, icon, onClick, href } = {}) {
     const b = el(href ? "a" : "button", "btn " + (cls || ""), (icon ? svg(icon, "sm") : "") + (label ? "<span>" + esc(label) + "</span>" : ""));
-    if (href) { b.href = href; if (href.startsWith("http")) { b.target = "_blank"; b.rel = "noopener"; } }
+    // Anything that is not a page inside this dashboard (#/...) opens in a new tab: live sites,
+    // domains, repositories and external pages never replace the dashboard.
+    if (href) { b.href = href; if (!href.startsWith("#")) { b.target = "_blank"; b.rel = "noopener noreferrer"; } }
     if (onClick) b.onclick = onClick;
     return b;
   }
@@ -208,6 +249,7 @@
     { id: "team", label: "Team", href: "#/team", icon: "team", admin: true },
     { id: "integrations", label: "Integrations", href: "#/integrations", icon: "integrations", admin: true },
     { id: "settings", label: "Settings", href: "#/settings", icon: "settings" },
+    { id: "payments", label: "Payments", href: "#/payments", icon: "billing", admin: true },
     { id: "billing", label: "Usage & Billing", href: "#/billing", icon: "billing" },
   ];
 
@@ -215,7 +257,7 @@
     const s = clear($("#sidebar"));
     s.append(el("a", "brand", '<span class="brand-mark"><img src="/static/images/codeskys-mark.png" alt="" style="width:100%;height:100%;object-fit:contain"></span><span>Codeskys</span><small>BETA</small>'));
     const wsBtn = el("button", "ws-switch", '<span class="ws-avatar">' + esc((State.user.name[0] || "W")) + '</span><span><b>' +
-      esc(State.user.name.split(" ")[0]) + "’s workspace</b><span>" + esc(cap(State.user.plan) + " plan") + "</span></span>" + svg("chevrondown", "sm"));
+      esc(State.user.name.split(" ")[0]) + "’s workspace</b><span>" + esc(planName(State.user.plan) + " plan") + "</span></span>" + svg("chevrondown", "sm"));
     wsBtn.onclick = () => go("#/billing");
     $(".brand", s).href = "#/";
     s.append(wsBtn);
@@ -227,17 +269,29 @@
         const a = el("a", it.id === currentNav ? "active" : "", svg(it.icon, "sm") + "<span>" + esc(it.label) + "</span>");
         a.href = it.href;
         if (it.id === "deployments" && State.buildingCount) a.append(el("span", "count", String(State.buildingCount)));
+        if (it.id === "payments") { a.id = "nav-payments"; if (State.pendingPayments) a.append(el("span", "count hot", String(State.pendingPayments))); }
         nav.append(a);
       });
       s.append(nav);
     };
     mk(NAV);
     mk(NAV_MANAGE, "Manage");
-    const foot = el("div", "side-foot");
-    const prov = State.status && State.status.provider === "coolify";
-    foot.append(el("div", "provider-pill", svg(prov ? "shield" : "bolt", "sm") +
-      "<span>Engine: <b style='color:var(--ink)'>" + engineLabel(prov ? "coolify" : "simulator") + "</b></span>"));
-    s.append(foot);
+    // Administrators see how many UPI payments are waiting for approval.
+    if (State.user.role === "admin") {
+      Api.get("/api/admin/upi?status=submitted").then((r) => {
+        State.pendingPayments = (r.counts || {}).submitted || 0;
+        const link = $("#nav-payments");
+        if (link) { const old = $(".count", link); if (old) old.remove(); if (State.pendingPayments) link.append(el("span", "count hot", String(State.pendingPayments))); }
+      }).catch(() => {});
+    }
+    // The build engine is an operator detail, so only administrators see it.
+    if (State.user.role === "admin") {
+      const foot = el("div", "side-foot");
+      const prov = State.status && State.status.provider === "coolify";
+      foot.append(el("div", "provider-pill", svg(prov ? "shield" : "bolt", "sm") +
+        "<span>Engine: <b style='color:var(--ink)'>" + engineLabel(prov ? "coolify" : "simulator") + "</b></span>"));
+      s.append(foot);
+    }
   }
   function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
   // Students never see the backend product name; administrators do.
@@ -467,7 +521,7 @@
 
     const planCard = el("div", "card card-pad");
     const lim = d.limits;
-    planCard.innerHTML = "<div class='row'><h3 style='margin:0'>" + cap(d.plan) + " plan</h3><span class='spacer'></span>" +
+    planCard.innerHTML = "<div class='row'><h3 style='margin:0'>" + planName(d.plan) + " plan</h3><span class='spacer'></span>" +
       "<a class='link small' href='#/billing'>Manage</a></div>";
     const usg = el("div"); usg.style.marginTop = "14px";
     usg.append(usageRow("Projects", s.projects, lim.projects));
@@ -499,18 +553,19 @@
     const a = el("a"); a.href = "#/projects/" + p.slug;
     const st = p.production ? p.production.status : p.latest ? p.latest.status : null;
     a.innerHTML = fwLogo(p.framework) + "<div class='txt' style='flex:1;min-width:0'><div class='row'><b class='ellipsis'>" + esc(p.name) + "</b>" +
-      (p.is_paused ? "<span class='badge warn'>Paused</span>" : "") + "</div><div class='muted small ellipsis'>" + esc(p.primary_domain || p.slug + ".codeskys.com") + "</div></div>" +
+      (p.is_paused ? "<span class='badge warn'>Paused</span>" : "") + "</div><div class='muted small ellipsis'>" + esc(liveHost(p)) + "</div></div>" +
       "<div class='row' style='gap:14px'>" + (st ? statusChip(st) : "<span class='muted small'>No deploys</span>") + "<span class='muted small' style='width:64px;text-align:right'>" + timeAgo(p.updated_at) + "</span></div>";
     return a;
   }
   function deployFeedItem(dep) {
-    const li = el("li"); li.style.cursor = "pointer";
+    const li = el("li"); li.style.cursor = dep.is_latest === false ? "default" : "pointer";
+    if (dep.is_latest === false) li.style.opacity = ".75";
     const kind = dep.status === "ready" ? "live" : dep.status === "failed" ? "bad" : "accent";
     li.innerHTML = "<span class='ico " + kind + "'>" + svg(dep.status === "failed" ? "alert" : "rocket", "sm") + "</span>" +
       "<div class='txt'><b>" + esc(dep.project_name) + "</b> <span class='muted small'>#" + dep.number + " · " + (dep.target) + "</span>" +
       "<div class='muted small ellipsis'>" + esc(dep.commit_message || dep.branch) + "</div></div>" +
       "<span class='when'>" + timeAgo(dep.created_at) + "</span>";
-    li.onclick = () => go("#/projects/" + dep.project_slug + "/deployments/" + dep.id);
+    if (dep.is_latest !== false) li.onclick = () => go("#/projects/" + dep.project_slug + "/deployments/" + dep.id);
     return li;
   }
 
@@ -581,7 +636,7 @@
       { label: "Open", icon: "external", action: () => go("#/projects/" + p.slug) },
       { label: "Deploy now", icon: "rocket", action: () => triggerDeploy(p.slug) },
       { label: "Settings", icon: "settings", action: () => go("#/projects/" + p.slug + "/settings") },
-      { label: "Visit site", icon: "globe", action: () => window.open(p.production ? ("/sites/" + p.slug + "/") : ("/sites/" + p.slug + "/"), "_blank") },
+      { label: "Visit Live Site", icon: "globe", action: () => (p.production && p.production.status === "ready" ? openNew(liveUrl(p)) : toast("This project is not live yet.", "error")) },
     ]);
   }
   async function triggerDeploy(slug, opts) {
@@ -593,7 +648,9 @@
   K.route("new", async (_a, params) => {
     K.setNav("projects");
     K.setCrumbs([{ label: "Projects", href: "#/projects" }, { label: "New project" }]);
-    const fw = (await Api.get("/api/frameworks")).frameworks;
+    const fwRes = await Api.get("/api/frameworks");
+    const fw = fwRes.frameworks;
+    State.maxUploadMb = fwRes.max_upload_mb || 100;
     const tab = ["templates", "connected", "upload"].includes(params.tab) ? params.tab : "import";
     const head = K.pageHead("Start a new project", "Upload your website files, import a Git repository, or begin from a template.");
     const tabs = el("div", "tabs");
@@ -614,27 +671,70 @@
   function fmtBytes(n) { return n < 1048576 ? Math.max(1, Math.round(n / 1024)) + " KB" : (n / 1048576).toFixed(1) + " MB"; }
 
   // A drag-and-drop zip chooser shared by "new project" and "upload new version".
+  // Accepts a .zip OR a whole project folder (chosen or dragged in). A folder is packed into a
+  // zip in the browser (see zipper.js) just before it is sent. `ready()` gives the File to send.
   function zipPicker() {
     const box = el("label", "drop");
     const input = el("input"); input.type = "file"; input.accept = ".zip,application/zip"; input.hidden = true;
+    const dirInput = el("input"); dirInput.type = "file"; dirInput.hidden = true; dirInput.multiple = true;
+    dirInput.setAttribute("webkitdirectory", ""); dirInput.setAttribute("directory", "");
     const msg = el("div", "drop-msg");
     box.append(input, msg);
-    let file = null;
+    const links = el("div", "drop-links");
+    const pickDir = el("button", "link-btn", "choose a folder"); pickDir.type = "button";
+    const pickZip = el("button", "link-btn", "choose a .zip"); pickZip.type = "button";
+    links.append(document.createTextNode("Or "), pickDir, document.createTextNode(" · "), pickZip);
+    links.addEventListener("click", (e) => e.stopPropagation());
+    pickDir.onclick = (e) => { e.preventDefault(); e.stopPropagation(); dirInput.click(); };
+    pickZip.onclick = (e) => { e.preventDefault(); e.stopPropagation(); input.click(); };
+    let file = null, folder = null;   // folder = { entries, rootName }
+    const maxMb = () => State.maxUploadMb || 100;
     function show() {
-      msg.innerHTML = file
-        ? svg("check") + "<div><b>" + esc(file.name) + "</b><div class='muted small'>" + fmtBytes(file.size) + " · click to choose a different file</div></div>"
-        : svg("upload") + "<div><b>Drop your .zip here</b><div class='muted small'>or click to choose a file</div></div>";
+      if (folder) {
+        const bytes = folder.entries.reduce((n, e) => n + e.file.size, 0);
+        msg.innerHTML = svg("check") + "<div><b>" + esc(folder.rootName || "Your folder") + "</b><div class='muted small'>" + folder.entries.length + " files · " + fmtBytes(bytes) +
+          (folder.skipped ? " · node_modules and hidden system files left out" : "") + " · click to choose again</div></div>";
+      } else if (file) {
+        msg.innerHTML = svg("check") + "<div><b>" + esc(file.name) + "</b><div class='muted small'>" + fmtBytes(file.size) + " · click to choose a different file</div></div>";
+      } else {
+        msg.innerHTML = svg("upload") + "<div><b>Drop your project folder or .zip here</b><div class='muted small'>or click to choose a .zip</div></div>";
+      }
     }
-    function set(f) {
-      if (f && !f.name.toLowerCase().endsWith(".zip")) { toast("Only .zip files can be uploaded.", "error"); return; }
-      file = f || null; show();
+    function setZip(f) {
+      if (f && !f.name.toLowerCase().endsWith(".zip")) { toast("That isn’t a .zip file. Drop a .zip, or drop your whole project folder.", "error"); return; }
+      file = f || null; folder = null; show();
     }
-    input.onchange = () => set(input.files[0]);
+    function setFolder(res, hadSkips) {
+      if (!res.entries.length) { toast("That folder has no files to upload.", "error"); return; }
+      res.skipped = hadSkips; folder = res; file = null; show();
+    }
+    input.onchange = () => setZip(input.files[0]);
+    dirInput.onchange = () => { const all = dirInput.files.length; const r = ZipTools.fromInput(dirInput.files); setFolder(r, r.entries.length < all); dirInput.value = ""; };
     ["dragenter", "dragover"].forEach((ev) => box.addEventListener(ev, (e) => { e.preventDefault(); box.classList.add("over"); }));
     ["dragleave", "drop"].forEach((ev) => box.addEventListener(ev, (e) => { e.preventDefault(); box.classList.remove("over"); }));
-    box.addEventListener("drop", (e) => set(e.dataTransfer.files[0]));
+    box.addEventListener("drop", async (e) => {
+      const items = [...(e.dataTransfer.items || [])];
+      const hasDir = items.some((i) => i.webkitGetAsEntry && i.webkitGetAsEntry() && i.webkitGetAsEntry().isDirectory);
+      if (hasDir) {
+        msg.innerHTML = "<span class='spinner'></span><div><b>Reading your folder…</b></div>";
+        try { const r = await ZipTools.fromDrop(e.dataTransfer); setFolder(r, true); } catch (err) { toast("Couldn’t read that folder. Try ‘choose a folder’ instead.", "error"); show(); }
+      } else setZip(e.dataTransfer.files[0]);
+    });
     show();
-    return { node: box, file: () => file };
+    const node = el("div"); node.append(box, links, dirInput);
+    return {
+      node,
+      has: () => !!(file || folder),
+      // The file to send: the chosen zip, or the folder packed into a zip.
+      async ready(onPack) {
+        if (file) return file;
+        if (!folder) return null;
+        const total = folder.entries.reduce((n, e) => n + e.file.size, 0);
+        if (total > maxMb() * 1024 * 1024) throw new Error("This folder is " + fmtBytes(total) + ". The limit is " + maxMb() + " MB. Remove large files such as videos or node_modules and try again.");
+        const blob = await ZipTools.build(folder.entries, onPack);
+        return new File([blob], (folder.rootName || "project") + ".zip", { type: "application/zip" });
+      },
+    };
   }
 
   function progressBar() {
@@ -647,7 +747,7 @@
   function renderUpload(wrap) {
     const card = el("div", "card card-pad");
     card.innerHTML = "<h3 style='margin:0 0 4px'>Upload your website files</h3>" +
-      "<p class='muted' style='margin:0 0 16px'>Upload a <b>.zip</b> of your finished website — HTML, CSS and JavaScript, or the built <b>dist</b> / <b>build</b> folder of a React, Vue or Vite project. It needs an <b>index.html</b>. Your link goes live in moments.</p>";
+      "<p class='muted' style='margin:0 0 16px'>Drop your project <b>folder</b> or a <b>.zip</b> — HTML, CSS and JavaScript, or the built <b>dist</b> / <b>build</b> folder of a React, Vue or Vite project. Up to <b>" + (State.maxUploadMb || 100) + " MB</b>. Your link goes live in moments.</p>";
     const nf = el("div", "field"); nf.innerHTML = "<label>Project name</label>";
     const ni = el("input", "input"); ni.placeholder = "My portfolio"; nf.append(ni);
     const lf = el("div", "field"); lf.innerHTML = "<label>Link name <span class='muted small'>(optional)</span></label>";
@@ -659,11 +759,13 @@
     go1.style.marginTop = "14px";
     go1.onclick = async () => {
       if (!ni.value.trim()) return toast("Give your project a name.", "error");
-      if (!picker.file()) return toast("Choose a .zip file first.", "error");
-      const form = new FormData();
-      form.append("name", ni.value.trim()); form.append("slug", li.value.trim()); form.append("file", picker.file());
-      spin(go1, "Uploading…");
+      if (!picker.has()) return toast("Choose your project folder or a .zip first.", "error");
+      spin(go1, "Preparing…");
       try {
+        const upFile = await picker.ready();
+        const form = new FormData();
+        form.append("name", ni.value.trim()); form.append("slug", li.value.trim()); form.append("file", upFile);
+        spin(go1, "Uploading…");
         const r = await Api.upload("/api/projects/upload", form, prog.set);
         toast("Files received");
         go("#/projects/" + r.project.slug + "/deployments/" + r.deployment_id);
@@ -677,15 +779,16 @@
   // Upload a new version of an uploaded project (free projects keep their original 24 hours).
   function openUploadModal(p) {
     const b = el("div");
-    b.append(el("p", "muted", "Upload a new .zip to replace your live site. The link stays the same, and the new version appears as soon as it is ready."));
+    b.append(el("p", "muted", "Upload a new folder or .zip to replace your live site. The link stays the same, and the new version appears as soon as it is ready."));
     const picker = zipPicker(); const prog = progressBar();
     b.append(picker.node, prog.node);
     const go1 = el("button", "btn accent", "Upload & update");
     go1.onclick = async () => {
-      if (!picker.file()) return toast("Choose a .zip file first.", "error");
-      const form = new FormData(); form.append("file", picker.file());
-      spin(go1, "Uploading…");
+      if (!picker.has()) return toast("Choose your project folder or a .zip first.", "error");
+      spin(go1, "Preparing…");
       try {
+        const form = new FormData(); form.append("file", await picker.ready());
+        spin(go1, "Uploading…");
         const r = await Api.upload("/api/projects/" + p.slug + "/upload", form, prog.set);
         K.closeLayer(); toast("Files received");
         go("#/projects/" + p.slug + "/deployments/" + r.deployment.id);
@@ -732,9 +835,12 @@
     const connected = provs.filter((p) => p.connected);
     if (!connected.length) {
       clear(body);
-      body.append(emptyState("git", "No Git account connected",
-        "Connect GitHub or GitLab to browse your repositories and deploy private ones.",
-        K.btn("Connect an account", { cls: "accent", icon: "link", href: "#/settings?s=git" })));
+      const box = emptyState("git", "No Git account connected",
+        "Connect GitHub or GitLab to browse your repositories and deploy private ones.");
+      const btns = el("div", "np-connect");
+      provs.forEach((pr) => btns.append(K.btn("Connect your " + pr.label + " account", { cls: pr.provider === "github" ? "accent" : "", icon: "git", onClick: () => connectGit(pr) })));
+      box.append(btns);
+      body.append(box);
       return;
     }
     const bar = el("div", "toolbar");
@@ -861,7 +967,7 @@
     function paintDetail(repo) {
       clear(detail);
       if (repo.reachable === false) {
-        const c = el("div", "callout warn"); c.innerHTML = svg("info") + "<div>Couldn’t read this repository from GitHub right now. You can still deploy it — pick the framework and build settings below.</div>";
+        const c = el("div", "callout warn"); c.dataset.keep = "1"; c.innerHTML = svg("info") + "<div>Couldn’t read this repository from GitHub right now. You can still deploy it — pick the framework and build settings below.</div>";
         detail.append(c);
       } else {
         const prev = el("div", "repo-preview");
@@ -982,7 +1088,8 @@
     { group: "Operations", items: [["forms", "Forms"], ["observability", "Observability"], ["activity", "Activity logs"], ["docs", "Documentation"]] },
   ];
   async function projectShell(slug, activeTab, builder) {
-    K.setNav("projects");
+    // A project's Deployments tab belongs under "Deployments" in the left menu.
+    K.setNav(activeTab === "deployments" ? "deployments" : "projects");
     let p;
     try { p = (await Api.get("/api/projects/" + slug)).project; }
     catch (e) { if (e.status === 404) return setView(view(emptyState("alert", "Project not found", "This project may have been deleted.", K.btn("Back to projects", { cls: "accent", href: "#/projects" })))); throw e; }
@@ -992,8 +1099,12 @@
     const t = el("div", "", "<h1>" + esc(p.name) + "</h1><div class='muted small'>" + svg("git", "sm") + " " + esc(p.repo_full_name || p.repo_url) + "</div>");
     t.style.minWidth = "0"; head.append(t);
     const actions = el("div", "actions");
-    actions.append(K.btn("Visit", { cls: "ghost", icon: "external", href: p.production && !p.production.is_simulated ? (p.production.url || "/sites/" + p.slug + "/") : "/sites/" + p.slug + "/" }));
-    actions.append(K.btn(p.source_type === "upload" ? "Upload new files" : "Deploy", { cls: "accent", icon: p.source_type === "upload" ? "upload" : "rocket", onClick: () => openDeployModal(p) }));
+    const liveNow = !!p.production && p.production.status === "ready";
+    const visit = K.btn("Visit Live Site", { cls: "ghost", icon: "external", href: liveNow ? liveHref(p) : undefined });
+    if (!liveNow) { visit.disabled = true; visit.title = "Not live yet"; }
+    actions.append(visit);
+    if (p.access && p.access.blocked) actions.append(K.btn("Upgrade to continue", { cls: "accent", icon: "bolt", href: "#/billing" }));
+    else actions.append(K.btn(p.source_type === "upload" ? "Upload new files" : "Deploy", { cls: "accent", icon: p.source_type === "upload" ? "upload" : "rocket", onClick: () => openDeployModal(p) }));
     const more = el("button", "icon-btn", svg("dots", "sm")); more.onclick = () => projectDetailMenu(more, p); actions.append(more); head.append(actions);
 
     const layout = el("div", "layout-side project-workspace");
@@ -1009,14 +1120,16 @@
     });
     const body = el("div", "stack project-workspace-body");
     layout.append(nav, body);
-    setView(view(head, layout));
+    const strip = planStrip(p);
+    if (strip) strip.style.marginBottom = "16px";
+    setView(view(...[head, strip, layout].filter(Boolean)));
     await builder(p, body);
   }
 
   function projectDetailMenu(anchor, p) {
     K.dropdown(anchor, [
-      { label: p.source_type === "upload" ? "Upload new files" : "Deploy now", icon: p.source_type === "upload" ? "upload" : "rocket", action: () => openDeployModal(p) },
-      ...(p.source_type === "upload" ? [] : [{ label: "Open repository", icon: "git", action: () => window.open(p.repo_url, "_blank") }]),
+      { label: p.access && p.access.blocked ? "Upgrade to continue" : p.source_type === "upload" ? "Upload new files" : "Deploy now", icon: p.access && p.access.blocked ? "bolt" : p.source_type === "upload" ? "upload" : "rocket", action: () => openDeployModal(p) },
+      ...(p.source_type === "upload" ? [] : [{ label: "Open repository", icon: "git", action: () => openNew(p.repo_url) }]),
       { label: p.is_paused ? "Resume project" : "Pause project", icon: p.is_paused ? "play" : "pause", action: () => togglePause(p) },
       { sep: true },
       { label: "Project settings", icon: "settings", action: () => go("#/projects/" + p.slug + "/settings") },
@@ -1029,13 +1142,22 @@
   }
   function deleteProject(p) {
     const b = el("div");
-    b.innerHTML = "<p class='muted'>This permanently removes the project, its deployments and domains. This cannot be undone.</p>";
+    const a = p.access || {};
+    // The free plan includes ONE project for life. Deleting it does not give a second one, so
+    // say so clearly before the person confirms.
+    if (a.is_free && !a.admin && (a.expires_at || a.blocked)) {
+      const w = el("div", "callout bad delete-warning");
+      w.innerHTML = svg("alert") + "<div><b>This is your only free project.</b> The Hobby plan includes one project. If you delete it, you will not be able to upload a new project on the Hobby plan. You will need to upgrade to publish another one.</div>";
+      b.append(w);
+    }
+    b.append(el("p", "muted", "This permanently removes the project, its deployments and domains. This cannot be undone."));
     const f = el("div", "field"); f.innerHTML = "<label>Type <b>" + esc(p.slug) + "</b> to confirm</label>";
     const i = el("input", "input mono"); i.placeholder = p.slug; f.append(i); b.append(f);
-    confirmModal({ title: "Delete " + p.name, body: b, confirmLabel: "Delete project", danger: true,
+    confirmModal({ title: a.is_free && !a.admin && (a.expires_at || a.blocked) ? "Delete your only free project?" : "Delete " + p.name, body: b, confirmLabel: "Delete project", danger: true,
       onConfirm: async () => { await Api.del("/api/projects/" + p.slug, { confirm: i.value.trim() }); toast("Project deleted"); go("#/projects"); } });
   }
   function openDeployModal(p) {
+    if (p.access && p.access.blocked) { toast(p.access.reason || "Your free 24 hours have ended. Upgrade to continue.", "error"); return go("#/billing"); }
     if (p.source_type === "upload") return openUploadModal(p);
     const b = el("div");
     const g = el("div", "field"); g.innerHTML = "<label>Branch</label>";
@@ -1063,37 +1185,57 @@
     const thumb = el("div", "preview-thumb " + (prod ? "" : "empty"));
     if (prod) thumb.innerHTML = "<div class='bar'></div><div class='l1'></div><div class='l2'></div><div class='l3'></div>"; else thumb.textContent = "No production deployment yet";
     shot.append(thumb);
-    if (prod) { const vb = K.btn("Open live site", { cls: "btn block", icon: "external", href: prod.is_upload && prod.url ? prod.url : "/sites/" + p.slug + "/" }); vb.style.marginTop = "12px"; shot.append(vb); }
+    if (prod && prod.status === "ready") { const vb = K.btn("Visit Live Site", { cls: "primary block", icon: "external", href: liveUrl(p) }); vb.style.marginTop = "12px"; shot.append(vb); }
+    if (prod && prod.status === "ready" && !prod.is_simulated && !hostingActive(p.hosting_until) && !(p.access && p.access.admin)) {
+      // Only when Paid Hosting can really be bought (payments configured and checkout open).
+      Api.get("/api/billing").then((bill) => {
+        const offer = bill && bill.enabled && bill.checkout_open && (bill.catalog || []).find((c) => c.grants_plan === "hosting");
+        if (!offer) return;
+        const price = "₹" + (offer.amount / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+        const ub = K.btn("Upgrade to Paid Hosting " + price, { cls: "accent block", icon: "rocket", href: "#/billing" });
+        ub.title = "Keep this deployment live for " + (offer.period_days >= 3650 ? "life" : offer.period_days + " days") + " instead of 24 hours"; ub.style.marginTop = "8px"; shot.append(ub);
+      }).catch(() => {});
+    }
     card.append(shot);
     const info = el("div", "info");
-    const dom = p.primary_domain || p.slug + ".codeskys.com";
-    info.append(kv("Status", (prod ? statusChip(prod.status) : "<span class='muted'>Not deployed</span>") + " " + simBadge(prod), true));
-    info.append(kv("Domain", "<a class='link' href='/sites/" + esc(p.slug) + "/' target='_blank'>" + esc(dom) + "</a>"));
+    const acc = p.access || {};
+    const planBadge = acc.admin ? "<span class='badge'>Admin</span>" : acc.lifetime ? "<span class='badge live'>Lifetime</span>" : acc.is_free ? "<span class='badge accent'>Free · 24 hours</span>" : "<span class='badge live'>Paid hosting</span>";
+    info.append(kv("Status", (prod ? statusChip(prod.status) : (acc.blocked ? "<span class='status expired'><i></i>Expired</span>" : "<span class='muted'>Not deployed</span>")) + " " + simBadge(prod) + " " + planBadge, true));
+    const liveAddr = absUrl(liveUrl(p));
+    info.append(kv("Live URL", prod && prod.status === "ready"
+      ? "<a class='link' href='" + esc(liveAddr) + "' target='_blank' rel='noopener noreferrer'>" + esc(liveHost(p)) + "</a>"
+      : "<span class='muted'>" + esc(liveHost(p)) + "</span>"));
     info.append(kv("Framework", p.framework_name));
     info.append(kv("Branch", "<span class='branch'>" + svg("branch", "sm") + esc(p.branch) + "</span>"));
     if (prod) { info.append(kv("Last deploy", dateTime(prod.finished_at || prod.created_at))); info.append(kv("Build time", duration(prod.duration_ms)));
-      info.append(kv("Expires", prod.expires_at ? (esc(expiryLabel(prod.expires_at)) + " <span class='muted small'>(" + dateTime(prod.expires_at) + ")</span>") : "—")); 
+      info.append(kv("Expires", acc.admin || acc.lifetime ? "Never" : prod.expires_at ? (esc(expiryLabel(prod.expires_at)) + " <span class='muted small'>(" + dateTime(prod.expires_at) + ")</span>") : "—"));
+      if (hostingActive(p.hosting_until) && !isLifetime(p.hosting_until)) info.append(kv("Paid hosting", "until " + esc(dateTime(p.hosting_until)) + " <span class='muted small'>(+24 h grace)</span>", true));
       info.append(kv("Commit", "<span class='sha'>" + esc((prod.commit_sha || "").slice(0, 7)) + "</span> " + esc(prod.commit_message || ""), true)); }
     card.append(info);
     body.append(card);
 
     const recent = el("div", "card"); recent.style.marginTop = "16px";
-    const ch = el("div", "card-head", "<div><h3>Recent deployments</h3></div><div class='actions'></div>");
+    const ch = el("div", "card-head", "<div><h3>History</h3><p>Only your latest deployment can be opened and redeployed. Older ones are kept as a record.</p></div><div class='actions'></div>");
     $(".actions", ch).append(K.btn("View all", { cls: "ghost sm", href: "#/projects/" + p.slug + "/deployments" }));
     recent.append(ch);
     if (!dd.deployments.length) recent.append(el("div", "card-pad muted", "No deployments yet."));
-    else dd.deployments.slice(0, 5).forEach((d) => recent.append(depRow(p, d, dd.current_id)));
+    else dd.deployments.slice(0, 5).forEach((d) => recent.append(depRow(p, d, dd.current_id, dd.latest_id)));
     body.append(recent);
   }));
   function kv(k, v, full) { return el("div", "kv" + (full ? " full" : ""), "<div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div>"); }
-  function depRow(p, d, currentId) {
-    const row = el("div", "dep-row");
-    row.innerHTML = "<div><div class='row'><span class='id'>#" + d.number + "</span>" + (d.id === currentId ? "<span class='badge live'>Production</span>" : d.target === "preview" ? "<span class='badge'>Preview</span>" : "") + "</div><div class='meta'>" + esc(d.trigger) + "</div></div>" +
+  // One line of the deployment history. Only the project's LATEST deployment is clickable;
+  // older ones are shown as a plain record (they cannot be opened or redeployed).
+  function depRow(p, d, currentId, latestId) {
+    const latest = latestId === undefined || d.id === latestId;
+    const row = el("div", "dep-row" + (latest ? "" : " history"));
+    if (!latest) row.title = "Older deployments are kept as history. Open the latest deployment to make changes.";
+    const exp = d.expires_at ? " · " + (d.status === "expired" ? "expired " : "expires ") + shortDate(d.expires_at) : "";
+    row.innerHTML = "<div><div class='row'><span class='id'>#" + d.number + "</span>" + (latest ? "<span class='badge accent'>Latest</span>" : "") + (d.id === currentId ? "<span class='badge live'>Production</span>" : d.target === "preview" ? "<span class='badge'>Preview</span>" : "") + "</div><div class='meta'>" + esc(d.trigger) + esc(exp) + "</div></div>" +
       "<div>" + statusChip(d.status) + "</div>" +
       "<div class='commit'><span class='sha'>" + esc((d.commit_sha || "").slice(0, 7)) + "</span><span class='msg'>" + esc(d.commit_message || d.branch) + "</span></div>" +
       "<div class='meta'><div class='branch'>" + svg("branch", "sm") + esc(d.branch) + "</div><div>" + timeAgo(d.created_at) + "</div></div>" +
-      "<div>" + svg("chevron", "sm") + "</div>";
-    row.onclick = () => go("#/projects/" + p.slug + "/deployments/" + d.id);
+      "<div>" + (latest ? svg("chevron", "sm") : "") + "</div>";
+    if (latest) row.onclick = () => go("#/projects/" + p.slug + "/deployments/" + d.id);
     return row;
   }
 
@@ -1101,9 +1243,9 @@
   K.route("projects/:slug/deployments", (a) => projectShell(a.slug, "deployments", async (p, body) => {
     const dd = await Api.get("/api/projects/" + p.slug + "/deployments");
     const card = el("div", "card");
-    card.append(el("div", "card-head", "<div><h3>Deployments</h3><p>" + dd.deployments.length + " total</p></div>"));
+    card.append(el("div", "card-head", "<div><h3>Deployment history</h3><p>" + dd.deployments.length + " total · only the latest deployment can be opened or redeployed</p></div>"));
     if (!dd.deployments.length) card.append(emptyState("deployments", "No deployments", "Deploy this project to see its build history here.", K.btn("Deploy now", { cls: "accent", icon: "rocket", onClick: () => openDeployModal(p) })));
-    else dd.deployments.forEach((d) => card.append(depRow(p, d, dd.current_id)));
+    else dd.deployments.forEach((d) => card.append(depRow(p, d, dd.current_id, dd.latest_id)));
     body.append(card);
   }));
 
@@ -1127,15 +1269,26 @@
   // ---------------------------------------------------------------- DEPLOYMENT DETAIL + LIVE LOGS
   const STAGES = ["queued", "initializing", "cloning", "installing", "building", "deploying", "ready"];
   let logPoll = null;
-  function stopPoll() { if (logPoll) { clearTimeout(logPoll); logPoll = null; } }
+  let buildTimer = null;
+  function stopPoll() { if (logPoll) { clearTimeout(logPoll); logPoll = null; } if (buildTimer) { clearInterval(buildTimer); buildTimer = null; } }
+  // For regular people, every "not available yet" warning is shown as an upgrade message instead.
+  // Administrators keep the original warnings so that each one can be found and fixed later.
+  function softenWarnings(root) {
+    if (!State.user || State.user.role === "admin") return;
+    root.querySelectorAll(".callout.warn:not([data-keep])").forEach((c) => {
+      c.className = "callout info upgrade-note";
+      c.innerHTML = svg("bolt") + "<div><b>Included in paid plans.</b> Upgrade your plan to unlock this feature.</div>";
+      c.append(K.btn("View plans", { cls: "sm accent", href: "#/billing" }));
+    });
+  }
 
   K.route("projects/:slug/deployments/:id", async (a) => {
     stopPoll();
-    K.setNav("projects");
-    let d, logs;
-    try { const r = await Api.get("/api/deployments/" + a.id); d = r.deployment; logs = r.logs; }
+    K.setNav("deployments");   // a deployment page is part of "Deployments" in the left menu
+    let d, logs, access = {};
+    try { const r = await Api.get("/api/deployments/" + a.id); d = r.deployment; logs = r.logs; access = r.access || {}; }
     catch (e) { if (e.status === 404) return setView(view(emptyState("alert", "Deployment not found", "", K.btn("Back", { cls: "accent", href: "#/projects/" + a.slug + "/deployments" })))); throw e; }
-    K.setCrumbs([{ label: "Projects", href: "#/projects" }, { label: d.project_name, href: "#/projects/" + a.slug }, { label: "Deploy #" + d.number }]);
+    K.setCrumbs([{ label: "Deployments", href: "#/deployments" }, { label: d.project_name, href: "#/projects/" + a.slug }, { label: "Deploy #" + d.number }]);
 
     const head = el("div", "proj-head");
     head.append(el("div", "", "<h1>Deployment #" + d.number + "</h1><div class='muted small'>" + esc(d.project_name) + " · " + esc(d.trigger) + "</div>"));
@@ -1147,7 +1300,12 @@
     function paintActions() {
       clear(actions);
       if (d.status === "building" || d.status === "queued") actions.append(K.btn("Cancel", { cls: "danger-ghost", icon: "x", onClick: cancelDep }));
-      if (d.url && d.status === "ready") actions.append(K.btn("Visit", { cls: "ghost", icon: "external", href: d.url }));
+      if (d.url && d.status === "ready" && (d.is_latest || d.is_current)) actions.append(K.btn("Visit", { cls: "ghost", icon: "external", href: d.url }));
+      if (!d.is_latest) return;   // older deployments are view-only history: no actions
+      if (access.blocked && ["ready", "failed", "cancelled", "expired"].includes(d.status)) {
+        actions.append(K.btn("Upgrade to continue", { cls: "accent", icon: "bolt", href: "#/billing" }));
+        return;
+      }
       if (d.is_upload && ["ready", "failed", "cancelled"].includes(d.status)) actions.append(K.btn("Upload new files", { cls: "accent", icon: "upload", onClick: () => openUploadModal({ slug: a.slug, name: d.project_name }) }));
       if (d.status === "ready" && !d.is_current && !d.is_upload) actions.append(K.btn("Promote to production", { cls: "accent", icon: "rocket", onClick: promote }));
       if (!d.is_upload && ["ready", "failed", "cancelled"].includes(d.status)) actions.append(K.btn("Redeploy", { cls: d.status === "ready" && d.is_current ? "accent" : "", icon: "refresh", onClick: redeploy }));
@@ -1221,22 +1379,70 @@
     filter.oninput = applyFilter;
     copyBtn.onclick = () => { navigator.clipboard.writeText(allLogs.map((l) => l.line).join("\n")).then(() => toast("Logs copied")); };
 
-    // Friendly waiting screen: no queue jargon, just "your project is being built".
-    const hall = el("div", "hall"); hall.hidden = true;
-    const HALL_MSGS = ["Packing your files…", "Checking everything is in place…", "Setting up your live link…", "Almost there…"];
-    let hallTick = 0, hallTimer = null;
+    // The "building" screen. People never see queue jargon: while a project waits or builds they see
+    // a calm progress page. The percentage is REAL (it follows the build stage), and after a while a
+    // clear note explains that larger projects take longer and asks them to keep the page open.
+    const hall = el("div", "build-card"); hall.hidden = true;
+    const PCT = { queued: 6, initializing: 14, cloning: 30, installing: 48, building: 70, deploying: 90 };
+    const COPY = {
+      queued: ["Preparing your build", "Your project is next in line and will start in a moment."],
+      initializing: ["Setting things up", "Preparing a clean, secure build environment for your project."],
+      cloning: ["Fetching your code", "Bringing your project files onto the build server."],
+      installing: ["Installing dependencies", "Downloading the packages your project needs. Projects with many dependencies take longer here."],
+      building: ["Building your project", "Compiling and packaging your application."],
+      deploying: ["Going live", "Starting your app and creating your live link."],
+    };
+    const TIPS = ["Your live link will appear on this page the moment it is ready.", "Every build runs in its own isolated environment.", "You can follow every step in the build log below.", "Nothing is lost if your connection drops; the build keeps running."];
+    const LONG_AFTER_MIN = 12;
+    let hallTick = 0, hallReady = false;
+    const H = {};
+    function mountHall() {
+      hall.innerHTML = "<div class='bc-head'><span class='bc-ico'></span><div class='bc-title'><b></b><span></span></div><div class='bc-pct'></div></div>" +
+        "<div class='bc-bar'><i></i></div>" +
+        "<div class='bc-meta'><span class='bc-stage'></span><span class='bc-time'></span></div>" +
+        "<div class='bc-tip'></div>" +
+        "<div class='bc-long' hidden></div>";
+      H.ico = $(".bc-ico", hall); H.title = $(".bc-title b", hall); H.sub = $(".bc-title span", hall); H.pct = $(".bc-pct", hall);
+      H.fill = $(".bc-bar i", hall); H.stage = $(".bc-stage", hall); H.time = $(".bc-time", hall); H.tip = $(".bc-tip", hall); H.long = $(".bc-long", hall);
+      H.ico.innerHTML = svg("rocket");
+      hallReady = true;
+    }
+    function hallMinutes() { const t = Date.parse(d.started_at || d.created_at); return isNaN(t) ? 0 : Math.max(0, (Date.now() - t) / 60000); }
     function paintHall() {
       const waiting = d.status === "queued" || d.status === "building";
       hall.hidden = !waiting;
-      clearInterval(hallTimer);
-      if (!waiting) return;
+      if (!waiting) { clearInterval(buildTimer); buildTimer = null; return; }
+      if (!hallReady) mountHall();
+      const stage = COPY[d.stage] ? d.stage : (d.status === "queued" ? "queued" : "building");
+      const pct = PCT[stage] || 6;
       const ahead = d.builds_ahead || 0;
-      const sub = d.status === "queued" && ahead > 0
-        ? (ahead === 1 ? "One project is being built just before yours." : ahead + " projects are being built just before yours.") + " This usually takes a minute or two — you can keep this page open."
-        : "This usually takes under a minute.";
-      hall.innerHTML = "<div class='spinner-ring'></div><div><b class='hall-msg'></b><div class='muted small'>" + esc(sub) + "</div></div>";
-      const m = $(".hall-msg", hall); const say = () => { m.textContent = HALL_MSGS[hallTick++ % HALL_MSGS.length]; };
-      say(); hallTimer = setInterval(say, 2400);
+      H.title.textContent = COPY[stage][0];
+      H.sub.textContent = stage === "queued" && ahead > 0 ? (ahead === 1 ? "One project is being built just before yours." : ahead + " projects are being built just before yours.") : COPY[stage][1];
+      H.pct.textContent = pct + "%";
+      H.fill.style.width = pct + "%";
+      H.stage.textContent = "Step " + Math.max(1, Math.min(6, STAGES.indexOf(stage) + (stage === "queued" ? 1 : 0))) + " of 6";
+      tickHall();
+      if (!buildTimer) buildTimer = setInterval(tickHall, 1000);
+    }
+    function tickHall() {
+      if (!hallReady) return;
+      const mins = hallMinutes(), s = Math.floor(mins * 60);
+      H.time.textContent = "Elapsed " + String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+      if (s % 6 === 0) H.tip.textContent = TIPS[hallTick++ % TIPS.length];
+      if (!H.tip.textContent) H.tip.textContent = TIPS[0];
+      if (mins >= LONG_AFTER_MIN) {
+        H.long.hidden = false;
+        if (!H.long.dataset.shown) {
+          H.long.dataset.shown = "1";
+          H.long.innerHTML = svg("info") + "<div><b>This build is taking longer than usual.</b> Your project is large or has many dependencies, so it needs more time to build and deploy. This is normal for complex projects and can take 20–30 minutes. <b>Please keep this page open</b>; your live link appears here automatically as soon as it is ready.</div>";
+        }
+      } else H.long.hidden = true;
+    }
+    if (d.is_latest === false) {
+      const old = el("div", "callout info"); old.style.marginBottom = "16px";
+      old.innerHTML = svg("info") + "<div><b>This is an older deployment, kept as history.</b> It can’t be redeployed. Open the project’s latest deployment to make changes.</div>";
+      old.append(K.btn("Go to deployments", { cls: "sm", href: "#/projects/" + a.slug + "/deployments" }));
+      bodyWrap.append(old);
     }
     bodyWrap.append(hall, summary, commitLine, stepsWrap, logCard);
     paintActions(); paintSummary(); paintSteps(); paintHall();
@@ -1247,7 +1453,7 @@
     async function poll() {
       try {
         const r = await Api.get("/api/deployments/" + d.id + "?after=" + lastId);
-        d = r.deployment;
+        d = r.deployment; access = r.access || access;
         if (r.logs.length) appendLogs(r.logs);
         paintActions(); paintSummary(); paintSteps(); paintHall();
         liveBadge.textContent = d.status === "building" || d.status === "queued" ? "● Live" : cap(d.status);
@@ -1626,12 +1832,74 @@
   // ---------------------------------------------------------------- PROJECT SETTINGS TAB
   K.route("projects/:slug/settings", (a) => projectShell(a.slug, "settings", async (p, body) => {
     const stack = el("div", "stack");
-    // general
-    const gen = settingCard("General", "Project name and description.");
-    const nf = el("div", "field"); nf.innerHTML = "<label>Project name</label>"; const ni = el("input", "input"); ni.value = p.name; nf.append(ni);
-    const df = el("div", "field"); df.innerHTML = "<label>Description</label>"; const di = el("input", "input"); di.value = p.description; df.append(di);
-    gen.body.append(nf, df);
-    gen.save(async () => { await Api.patch("/api/projects/" + p.slug, { name: ni.value.trim(), description: di.value }); });
+    // ---- Project name: the name AND the live link (checked for availability as you type)
+    const nameCard = el("div", "card setting"); nameCard.id = "name";
+    nameCard.append(el("div", "card-head", "<div><h3>Project name</h3><p>Your project name is also part of its live link. Change the name and the link changes with it.</p></div>"));
+    const nb = el("div", "card-pad"); nameCard.append(nb);
+    const nameField = el("div", "field"); nameField.innerHTML = "<label for='pname'>Project name</label>";
+    const nameWrap = el("div", "name-input");
+    const ni = el("input", "input"); ni.id = "pname"; ni.value = p.name; ni.maxLength = 64; ni.autocomplete = "off"; ni.spellcheck = false;
+    const mark = el("span", "name-mark"); mark.setAttribute("aria-live", "polite");
+    nameWrap.append(ni, mark); nameField.append(nameWrap);
+    const linkLine = el("div", "link-preview"); nameField.append(linkLine);
+    const nameMsg = el("div", "name-msg"); nameField.append(nameMsg);
+    nb.append(nameField);
+    const nfoot = el("div", "card-foot"); const nact = el("div", "actions");
+    const saveName = el("button", "btn accent", "Save changes"); saveName.disabled = true;
+    nfoot.append(el("span", "muted small", p.link_editable ? "" : "This app’s link can’t be renamed yet; only its display name changes."), nact); nact.append(saveName); nameCard.append(nfoot);
+    const linkFor = (slug) => absUrl(liveHref(p)).replace("/live/" + p.slug + "/", "/live/" + slug + "/").replace("/sites/" + p.slug + "/", "/sites/" + slug + "/").replace("//" + p.slug + ".", "//" + slug + ".");
+    const showLink = (slug) => { linkLine.innerHTML = svg("link", "sm") + "<span>Your link: <b>" + esc(linkFor(slug).replace(/^https?:\/\//, "")) + "</b></span>"; };
+    showLink(p.slug);
+    let verdict = { ok: false, slug: p.slug, same: true };
+    let checkTimer = null, checkSeq = 0;
+    function paintVerdict(state, msg) {
+      mark.className = "name-mark " + state;
+      mark.innerHTML = state === "ok" ? svg("check", "sm") : state === "bad" ? svg("x", "sm") : state === "busy" ? "<span class='spinner'></span>" : "";
+      mark.title = state === "ok" ? "Available" : state === "bad" ? "Not available" : "";
+      nameMsg.className = "name-msg " + state; nameMsg.textContent = msg || "";
+    }
+    function refreshSave() {
+      const changed = ni.value.trim() !== p.name || (verdict.slug !== p.slug && p.link_editable);
+      saveName.disabled = !(verdict.ok && changed);
+    }
+    async function runCheck() {
+      const v = ni.value.trim(); const seq = ++checkSeq;
+      if (!v) { verdict = { ok: false, slug: p.slug, same: true }; paintVerdict("bad", "Type a project name."); refreshSave(); return; }
+      if (!p.link_editable) { verdict = { ok: true, slug: p.slug, same: true }; paintVerdict("", ""); refreshSave(); return; }
+      paintVerdict("busy", "Checking…"); saveName.disabled = true;
+      try {
+        const r = await Api.get("/api/projects/" + p.slug + "/link-check?name=" + encodeURIComponent(v));
+        if (seq !== checkSeq) return;           // a newer keystroke is already being checked
+        verdict = { ok: r.available, slug: r.slug || p.slug, same: r.same };
+        showLink(r.slug || p.slug);
+        if (r.same) paintVerdict("", "This is your current link.");
+        else if (r.available) paintVerdict("ok", "Available. Your link will be " + (r.slug || ""));
+        else paintVerdict("bad", r.reason || "That name is not available.");
+      } catch (e) { if (seq === checkSeq) { verdict = { ok: false, slug: p.slug, same: true }; paintVerdict("bad", e.message); } }
+      refreshSave();
+    }
+    ni.addEventListener("input", () => { clearTimeout(checkTimer); verdict = { ok: false, slug: p.slug, same: true }; saveName.disabled = true; checkTimer = setTimeout(runCheck, 350); });
+    saveName.onclick = async () => {
+      const newName = ni.value.trim();
+      const linkChanges = p.link_editable && verdict.slug !== p.slug;
+      const doSave = async () => {
+        const body = { name: newName }; if (linkChanges) body.slug = verdict.slug;
+        const r = await Api.patch("/api/projects/" + p.slug, body);
+        toast(linkChanges ? "Project name and link updated" : "Project name updated");
+        if (linkChanges) go("#/projects/" + r.project.slug + "/settings"); else K.render();
+      };
+      if (!linkChanges) { spin(saveName, "Saving…"); try { await doSave(); } catch (e) { toast(e.message, "error"); unspin(saveName); refreshSave(); } return; }
+      const b = el("div"); b.innerHTML = "<p class='muted'>Your live link is changing:</p><div class='link-change'><div><span class='muted small'>Old link</span><code>" + esc(linkFor(p.slug).replace(/^https?:\/\//, "")) + "</code></div><div><span class='muted small'>New link</span><code>" + esc(linkFor(verdict.slug).replace(/^https?:\/\//, "")) + "</code></div></div><p class='muted small' style='margin-top:12px'>The old link stops working straight away, so update anywhere you have shared it.</p>";
+      confirmModal({ title: "Change your live link?", body: b, confirmLabel: "Change name and link", onConfirm: doSave });
+    };
+    refreshSave();
+
+    // ---- Description: its own card, separate from the name
+    const descCard = settingCard("Description", "A short note about what this project is. It does not affect your link.");
+    const df = el("div", "field"); df.innerHTML = "<label for='pdesc'>Description</label>";
+    const di = el("textarea", "textarea"); di.id = "pdesc"; di.rows = 3; di.maxLength = 300; di.value = p.description || ""; di.style.height = "auto"; di.style.padding = "9px 11px";
+    df.append(di); descCard.body.append(df);
+    descCard.save(async () => { await Api.patch("/api/projects/" + p.slug, { description: di.value }); });
 
     // build settings
     const build = settingCard("Build & development", "How Codeskys builds and runs your project.");
@@ -1654,10 +1922,11 @@
     const auto = toggleRow("Automatic deployments", "Deploy automatically when the deploy hook is called.", p.auto_deploy);
     const prev = toggleRow("Preview deployments", "Create preview deployments for non-production branches.", p.preview_deploys);
     git.body.append(auto.row, prev.row);
+    // The free 24 hours are a plan rule, so only an administrator can change a project's lifetime.
     const ttlF = el("div", "field");
-    ttlF.innerHTML = "<label>Deployment lifetime (hours)</label><div class='hint'>Every deployment is torn down automatically once it reaches this age.</div>";
+    ttlF.innerHTML = "<label>Deployment lifetime (hours) <span class='badge'>Admin</span></label><div class='hint'>Free projects are torn down automatically once they reach this age.</div>";
     const ttlI = el("input", "input"); ttlI.type = "number"; ttlI.min = "1"; ttlI.value = p.ttl_hours; ttlF.append(ttlI);
-    git.body.append(ttlF);
+    if (State.user.role === "admin") git.body.append(ttlF);
     const hook = el("div", "field"); hook.style.marginTop = "6px";
     hook.innerHTML = "<label>Webhook URLs</label><div class='hint'>Add the matching URL in your repository settings so every push redeploys. GitHub signs with the secret; GitLab sends it as a token.</div>";
     hook.append(el("div", "muted small", "GitHub — Settings → Webhooks (content type: application/json)"));
@@ -1672,7 +1941,7 @@
     const rotate = K.btn("Rotate hook URL", { cls: "ghost sm", icon: "refresh", onClick: () => confirmModal({ title: "Rotate deploy hook?", desc: "The current URL will stop working immediately.", confirmLabel: "Rotate", onConfirm: async () => { await Api.post("/api/projects/" + p.slug + "/hook/rotate"); toast("Hook rotated"); K.render(); } }) });
     hook.append(rotate);
     git.body.append(hook);
-    git.save(async () => { await Api.patch("/api/projects/" + p.slug, { auto_deploy: auto.input.checked, preview_deploys: prev.input.checked, ttl_hours: ttlI.value }); });
+    git.save(async () => { await Api.patch("/api/projects/" + p.slug, { auto_deploy: auto.input.checked, preview_deploys: prev.input.checked, ...(State.user.role === "admin" ? { ttl_hours: ttlI.value } : {}) }); });
 
     // danger
     const danger = el("div", "card setting"); danger.style.borderColor = "var(--bad)";
@@ -1684,7 +1953,7 @@
     delRow.append(K.btn("Delete project", { cls: "danger", icon: "trash", onClick: () => deleteProject(p) }));
     dbody.append(pauseRow, el("div", "divider"), delRow); danger.append(dbody);
 
-    stack.append(gen.card, build.card, git.card, authorizationCard(p), liveAppCard(p), danger);
+    stack.append(nameCard, descCard.card, build.card, git.card, authorizationCard(p), liveAppCard(p), danger);
     body.append(stack);
   }));
 
@@ -1777,12 +2046,13 @@
     const card = el("div", "card");
     if (!d.deployments.length) card.append(emptyState("deployments", "No deployments", status ? "No deployments with this status." : "Deploy a project to see builds here.", K.btn("New project", { cls: "accent", icon: "plus", href: "#/new" })));
     else d.deployments.forEach((dep) => {
-      const row = el("div", "dep-row");
-      row.innerHTML = "<div><div class='row'><b class='ellipsis'>" + esc(dep.project_name) + "</b></div><div class='meta'>#" + dep.number + " · " + esc(dep.trigger) + (dep.is_current ? " · <span style='color:var(--live)'>production</span>" : "") + "</div></div>" +
+      const row = el("div", "dep-row" + (dep.is_latest ? "" : " history"));
+      if (!dep.is_latest) row.title = "Older deployments are kept as history. Open the project's latest deployment to make changes.";
+      row.innerHTML = "<div><div class='row'><b class='ellipsis'>" + esc(dep.project_name) + "</b>" + (dep.is_latest ? "<span class='badge accent'>Latest</span>" : "") + "</div><div class='meta'>#" + dep.number + " · " + esc(dep.trigger) + (dep.is_current ? " · <span style='color:var(--live)'>production</span>" : "") + (dep.expires_at ? " · " + (dep.status === "expired" ? "expired " : "expires ") + shortDate(dep.expires_at) : "") + "</div></div>" +
         "<div>" + statusChip(dep.status) + "</div>" +
         "<div class='commit'><span class='sha'>" + esc((dep.commit_sha || "").slice(0, 7)) + "</span><span class='msg'>" + esc(dep.commit_message || dep.branch) + "</span></div>" +
-        "<div class='meta'><div class='branch'>" + svg("branch", "sm") + esc(dep.branch) + "</div><div>" + timeAgo(dep.created_at) + "</div></div><div>" + svg("chevron", "sm") + "</div>";
-      row.onclick = () => go("#/projects/" + dep.project_slug + "/deployments/" + dep.id);
+        "<div class='meta'><div class='branch'>" + svg("branch", "sm") + esc(dep.branch) + "</div><div>" + timeAgo(dep.created_at) + "</div></div><div>" + (dep.is_latest ? svg("chevron", "sm") : "") + "</div>";
+      if (dep.is_latest) row.onclick = () => go("#/projects/" + dep.project_slug + "/deployments/" + dep.id);
       card.append(row);
     });
     setView(view(head, toolbar, card));
@@ -1864,7 +2134,7 @@
       const tr = el("tr");
       tr.innerHTML = "<td><div class='row'><span class='avatar sm'>" + esc(u.name[0] || "?") + "</span><div style='min-width:0'><b class='ellipsis'>" + esc(u.name) + "</b><div class='muted small ellipsis'>" + esc(u.email) + "</div></div></div></td>" +
         "<td><span class='badge " + (u.role === "admin" ? "accent" : "") + "'>" + cap(u.role) + "</span></td>" +
-        "<td>" + cap(u.plan) + "</td><td>" + u.projects + "</td>" +
+        "<td>" + planName(u.plan) + "</td><td>" + u.projects + "</td>" +
         "<td class='muted small'>" + (u.last_login_at ? timeAgo(u.last_login_at) : "never") + "</td>";
       const act = el("td"); act.style.textAlign = "right";
       if (!u.is_active) act.append(el("span", "badge bad", "Deactivated"));
@@ -1904,7 +2174,7 @@
     const ef = el("div", "field"); ef.innerHTML = "<label>Email address</label>"; const ei = el("input", "input"); ei.type = "email"; ef.append(ei);
     const g = el("div", "grid-2");
     const rf = el("div", "field"); rf.innerHTML = "<label>Role</label>"; const rs = el("select", "select"); rs.innerHTML = "<option value='student'>Member</option><option value='admin'>Admin</option>"; rf.append(rs);
-    const pf = el("div", "field"); pf.innerHTML = "<label>Plan</label>"; const ps = el("select", "select"); ps.innerHTML = "<option value='hobby'>Free</option><option value='pro'>Pro</option><option value='team'>Premium</option>"; pf.append(ps);
+    const pf = el("div", "field"); pf.innerHTML = "<label>Plan</label>"; const ps = el("select", "select"); ps.innerHTML = "<option value='hobby'>Free</option><option value='pro'>Student (6 months)</option><option value='lifetime'>Lifetime</option><option value='team'>Premium</option>"; pf.append(ps);
     g.append(rf, pf);
     b.append(nf, ef, g);
     const co = el("div", "callout info"); co.innerHTML = svg("info") + "<div>Codeskys generates a temporary password you can share. The member can change it after signing in.</div>";
@@ -2070,20 +2340,15 @@
         const row = el("div", "row");
         row.style.cssText = "padding:10px 0;gap:12px";
         row.innerHTML = svg("git", "lg") + "<div style='flex:1;min-width:0'><b>" + esc(pr.label) + "</b>" +
-          "<div class='muted small'>" + (pr.connected ? "Connected as " + esc(pr.username) :
-            pr.configured ? "Not connected" : "Not configured on this server") + "</div></div>";
-        if (!pr.configured) {
-          const help = el("span", "badge warn", "Needs setup");
-          help.title = "An administrator must set " + pr.provider.toUpperCase() + "_CLIENT_ID and _CLIENT_SECRET";
-          row.append(help);
-        } else if (pr.connected) {
+          "<div class='muted small'>" + (pr.connected ? "Connected as " + esc(pr.username) : "Not connected") + "</div></div>";
+        if (pr.connected) {
           row.append(K.btn("Disconnect", { cls: "danger-ghost sm", icon: "x", onClick: () => disconnectGit(pr) }));
         } else {
           row.append(K.btn("Connect", { cls: "accent sm", icon: "link", onClick: () => connectGit(pr) }));
         }
         gbody.append(row);
       });
-      if (!provs.some((x) => x.configured)) {
+      if (!provs.some((x) => x.configured) && State.user.role === "admin") {
         const co = el("div", "callout info");
         co.innerHTML = svg("info") + "<div>No Git provider is configured yet. An administrator sets <b>GITHUB_CLIENT_ID</b> / <b>GITHUB_CLIENT_SECRET</b> (and the GitLab pair) in the environment, using the callback URL shown in the setup guide.</div>";
         gbody.append(co);
@@ -2092,17 +2357,26 @@
     git.append(gbody);
 
     // security
-    const sec = settingCard("Password", "Use at least 12 characters.");
+    const sec = settingCard("Password", "Use at least 12 characters, with upper and lower case letters, a number and a symbol.");
     const cf = el("div", "field"); cf.innerHTML = "<label>Current password</label>"; const ci = el("input", "input"); ci.type = "password"; cf.append(ci);
     const g = el("div", "grid-2");
     const n1 = el("div", "field"); n1.innerHTML = "<label>New password</label>"; const ni1 = el("input", "input"); ni1.type = "password"; n1.append(ni1);
     const n2 = el("div", "field"); n2.innerHTML = "<label>Confirm new password</label>"; const ni2 = el("input", "input"); ni2.type = "password"; n2.append(ni2);
     g.append(n1, n2);
     sec.body.append(cf, g);
+    ci.autocomplete = "current-password"; ni1.autocomplete = "new-password"; ni2.autocomplete = "new-password";
+    PwTools.eye(ci);
+    const w1 = PwTools.eye(ni1), w2 = PwTools.eye(ni2);
+    const pm = PwTools.meter(ni1); n1.append(pm.node);
+    sec.body.append(PwTools.suggest([ni1, ni2], [w1, w2]));
     sec.save(async () => {
+      if (!ci.value) throw new Error("Enter your current password.");
+      if (PwTools.score(ni1.value).met < PwTools.RULES.length) throw new Error("Choose a stronger password. Follow the checklist under the new password.");
       if (ni1.value !== ni2.value) throw new Error("The new passwords don’t match.");
       await Api.post("/api/account/password", { current: ci.value, new: ni1.value });
       ci.value = ni1.value = ni2.value = "";
+      ni1.dispatchEvent(new Event("input"));
+      [w1, w2].forEach((w) => w._reveal && w._reveal(false));
     });
     sec.card.id = "security";
 
@@ -2147,6 +2421,17 @@
     if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
   });
   async function connectGit(pr) {
+    if (!pr.configured) {
+      // Nothing is broken on the person's side: the platform just has not been given this
+      // provider's keys yet. Say so plainly and offer the ways that already work.
+      const b = el("div");
+      const admin = State.user.role === "admin";
+      b.innerHTML = "<p class='muted' style='margin-top:0'>Signing in with " + esc(pr.label) + " isn’t switched on for this workspace yet.</p>" +
+        (admin ? "<p>To switch it on, add <b>" + esc(pr.provider.toUpperCase()) + "_CLIENT_ID</b> and <b>" + esc(pr.provider.toUpperCase()) + "_CLIENT_SECRET</b> to the server settings, then restart. The setup guide has the exact steps.</p>"
+                 : "<p>The Codeskys team needs to finish this setup first. Until then you can <b>upload your files</b> or <b>paste a public GitHub URL</b> to deploy.</p>");
+      openModal({ title: "Connect " + pr.label, body: b, foot: [K.btn("Upload files", { cls: "ghost", href: "#/new?tab=upload", onClick: closeLayer }), K.btn("Got it", { cls: "accent", onClick: closeLayer })] });
+      return;
+    }
     try {
       const { url } = await Api.get("/api/git/" + pr.provider + "/authorize");
       window.location.assign(url);
@@ -2179,10 +2464,12 @@
 
   // ---------------------------------------------------------------- BILLING
   const PLANS = [
-    { id: "hobby", name: "Free", price: "₹0", per: "", feats: ["1 project", "300 build minutes / month", "100 GB bandwidth", "1 concurrent build", "Free Codeskys subdomain", "Community support"] },
-    { id: "pro", name: "Student", price: "₹500", per: "/ 6 months", feats: ["100 projects", "3,000 build minutes / month", "1 TB bandwidth", "3 concurrent builds", "Custom domains + SSL", "Email support"] },
-    { id: "team", name: "Premium", price: "₹2,499", per: " · period to be confirmed", unavailable: true, feats: ["1,000 projects", "25,000 build minutes / month", "5 TB bandwidth", "10 concurrent builds", "Team roles & audit log", "Priority support"] },
+    { id: "hobby", name: "Free", price: "₹0", per: "", feats: ["1 project, live for 24 hours", "Update and redeploy as often as you like inside the 24 hours", "Same expiry for every update", "100 MB per upload", "Free Codeskys link", "Community support"] },
+    { id: "pro", name: "Student · 6 months", price: "₹510", per: " / 6 months", feats: ["Your projects stay live for 6 months", "Up to 100 projects", "3,000 build minutes / month", "Custom domains + SSL", "Email support"] },
+    { id: "lifetime", name: "Lifetime", price: "₹1,599", per: " · pay once", best: true, feats: ["Your projects stay live for life", "Up to 100 projects", "3,000 build minutes / month", "Custom domains + SSL", "No renewals, ever"] }
   ];
+  const planName = (id) => ({ hobby: "Free", pro: "Student", lifetime: "Lifetime", team: "Premium" }[id] || cap(id));
+  const periodLabel = (days) => days >= 3650 ? " · pay once" : days === 180 ? " / 6 months" : " / " + days + " days";
   K.route("billing", async () => {
     K.setNav("billing"); skeletonPage();
     const d = await Api.get("/api/overview");
@@ -2191,7 +2478,7 @@
     const head = K.pageHead("Usage & billing", "Your plan, current usage and available upgrades.");
     const lim = d.limits;
     const usage = el("div", "card");
-    usage.append(el("div", "card-head", "<div><h3>Current usage</h3><p>Billing period: last 30 days</p></div><div class='actions'><span class='badge accent'>" + cap(d.plan) + " plan</span></div>"));
+    usage.append(el("div", "card-head", "<div><h3>Current usage</h3><p>Billing period: last 30 days</p></div><div class='actions'><span class='badge accent'>" + planName(d.plan) + " plan</span></div>"));
     const ub = el("div", "card-pad");
     ub.append(usageRow("Projects", d.stats.projects, lim.projects));
     ub.append(usageRow("Build minutes", Math.round(d.stats.build_minutes), lim.build_minutes));
@@ -2201,12 +2488,17 @@
 
     let b = { enabled: false, catalog: [], payments: [], account: { plan: d.plan } };
     try { b = await Api.get("/api/billing"); } catch (_) {}
+    let U = { enabled: false, offers: [], payments: [] };
+    try { U = await Api.get("/api/upi"); } catch (_) {}
     K.setNav("billing");
     const acct = b.account || { plan: d.plan };
     const status = el("div", "callout info");
+    const paidNow = hostingActive(acct.hosting_until);
     status.innerHTML = svg("info") + "<div><b>" + esc(cap(acct.plan)) + " plan</b>" +
       (acct.plan_expires_at ? " · active until " + esc(new Date(acct.plan_expires_at).toLocaleDateString()) :
-        acct.managed_by_admin ? " · managed by an administrator" : "") + "</div>";
+        acct.managed_by_admin ? " · managed by an administrator" :
+        paidNow ? "" : " · your project is live for 24 hours; upgrade to keep it online") +
+      (paidNow ? (isLifetime(acct.hosting_until) ? " · <b>Lifetime hosting</b>, nothing more to pay" : " · <b>Paid hosting</b> until " + esc(new Date(acct.hosting_until).toLocaleString())) : "") + "</div>";
 
     const plans = el("div", "plans");
     let note;
@@ -2214,15 +2506,22 @@
       b.catalog.forEach((c) => {
         const card = el("div", "card plan");
         const price = "₹" + (c.amount / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 });
-        card.innerHTML = "<h3>" + esc(c.name) + (b.mode === "test" ? " <span class='badge warn'>Test mode</span>" : "") +
-          "</h3><div class='price'>" + price + "<small> / " + c.period_days + " days</small></div>";
+        const forever = c.period_days >= 3650;
+        card.innerHTML = "<h3>" + esc(c.name) + (forever ? " <span class='badge live'>Best value</span>" : "") + (b.mode === "test" ? " <span class='badge warn'>Test mode</span>" : "") +
+          "</h3><div class='price'>" + price + "<small>" + esc(periodLabel(c.period_days)) + "</small></div>";
         const ul = el("ul");
+        const hosting = c.grants_plan === "hosting";
         const lim = (PLANS.find((x) => x.id === c.grants_plan) || {}).feats;
-        [c.description, cap(c.grants_plan) + " plan limits for " + c.period_days + " days", "Renewing extends your current end date"]
-          .concat(lim || []).filter(Boolean).forEach((f) => ul.append(el("li", "", svg("check", "sm") + "<span>" + esc(f) + "</span>")));
+        (hosting ? [c.description, forever ? "Pay once. No renewals, ever." : "Renewing adds " + Math.round(c.period_days / 30) + " months to your end date",
+                    "No 24-hour limit while it is paid: same live URL, no rebuild", forever ? "Up to 100 projects" : "Up to 100 projects, 24-hour grace after it ends"]
+          : [c.description, cap(c.grants_plan) + " plan limits for " + c.period_days + " days", "Renewing extends your current end date"].concat(lim || []))
+          .filter(Boolean).forEach((f) => ul.append(el("li", "", svg("check", "sm") + "<span>" + esc(f) + "</span>")));
         card.append(ul);
-        const btn = K.btn(acct.plan === c.grants_plan ? "Renew" : "Pay " + price, { cls: "accent", onClick: () => startCheckout(c, btn) });
-        if (acct.managed_by_admin) btn.disabled = true;
+        const haveLifetime = hosting && isLifetime(acct.hosting_until);
+        const label = hosting ? (haveLifetime ? "You have lifetime hosting" : forever ? "Get Lifetime " + price : hostingActive(acct.hosting_until) ? "Renew " + price : "Upgrade to Paid Hosting " + price)
+          : acct.plan === c.grants_plan ? "Renew" : "Pay " + price;
+        const btn = K.btn(label, { cls: "accent", onClick: () => startCheckout(c, btn) });
+        if ((acct.managed_by_admin && !hosting) || haveLifetime) btn.disabled = true;
         card.append(btn);
         plans.append(card);
       });
@@ -2230,10 +2529,12 @@
       note.innerHTML = svg("info") + "<div>" + (b.mode === "test"
         ? "<b>Test mode.</b> Payments go through the Razorpay sandbox. No real money is charged."
         : "Payments are processed by Razorpay. Your access updates as soon as the payment is confirmed.") + "</div>";
+    } else if (U.enabled && U.offers.length) {
+      note = upiPlanCards(plans, U, acct);
     } else {
       PLANS.forEach((p) => {
         const c = el("div", "card plan" + (p.id === d.plan ? " current" : ""));
-        c.innerHTML = "<h3>" + p.name + (p.id === d.plan ? " <span class='badge accent'>Current</span>" : "") + "</h3><div class='price'>" + p.price + "<small>" + p.per + "</small></div>";
+        c.innerHTML = "<h3>" + p.name + (p.id === d.plan ? " <span class='badge accent'>Current</span>" : p.best ? " <span class='badge live'>Best value</span>" : "") + "</h3><div class='price'>" + p.price + "<small>" + p.per + "</small></div>";
         const ul = el("ul"); p.feats.forEach((f) => ul.append(el("li", "", svg("check", "sm") + "<span>" + esc(f) + "</span>")));
         c.append(ul);
         const bt = K.btn(p.id === d.plan ? "Current plan" : p.unavailable ? "Not available yet" : "Upgrade to " + p.name, { cls: p.id === d.plan || p.unavailable ? "" : "accent", onClick: () => toast("Payments are not open yet. Plans are set by an administrator for now.") });
@@ -2266,8 +2567,293 @@
       table.append(tb);
       hist.append(table);
     }
-    setView(view(head, status, usage, el("div", "divider"), plans, note, el("div", "divider"), hist));
+    const waiting = (U.payments || []).find((x) => x.status === "submitted");
+    let verifying = null;
+    if (waiting) {
+      verifying = el("div", "callout warn"); verifying.style.marginBottom = "16px";
+      verifying.dataset.keep = "1";
+      verifying.innerHTML = svg("clock") + "<div><b>Payment verification in progress.</b> " + esc(money(waiting.amount)) + " for " + esc(waiting.plan_name) + " (" + esc(waiting.ref) + "). Verification takes up to 8 hours; your plan activates automatically once it is approved.</div>";
+      verifying.append(K.btn("View status", { cls: "sm", href: "#/pay/" + waiting.ref }));
+    }
+    const upiHist = upiHistoryCard(U);
+    setView(view(...[head, verifying, status, usage, el("div", "divider"), plans, note, upiHist, el("div", "divider"), hist].filter(Boolean)));
   });
+
+  // ---------------------------------------------------------------- UPI PAYMENTS
+  // Pay with any UPI app -> type the transaction ID -> an administrator approves it.
+  const money = (paise) => "₹" + (paise / 100).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const durationLabel = (p) => (p.forever || p.period_days >= 3650) ? "Lifetime" : Math.round(p.period_days / 30) + " months";
+  const upiTone = { awaiting_payment: "", submitted: "warn", approved: "live", rejected: "bad", cancelled: "" };
+  const upiLabel = { awaiting_payment: "Awaiting payment", submitted: "Verifying", approved: "Approved", rejected: "Not verified", cancelled: "Cancelled" };
+  function copyButton(text, label) {
+    const b = el("button", "copy-btn", svg("copy", "sm")); b.type = "button"; b.title = "Copy " + (label || "");
+    b.onclick = () => navigator.clipboard.writeText(text).then(() => toast("Copied")).catch(() => toast("Couldn’t copy. Select the text instead.", "error"));
+    return b;
+  }
+  async function startUpiOrder(code, btn) {
+    spin(btn, "Preparing…");
+    try { const r = await Api.post("/api/upi/orders", { plan: code }); go("#/pay/" + r.payment.ref); }
+    catch (e) { toast(e.message, "error"); unspin(btn); }
+  }
+  // The three plan cards on Usage & Billing when payments go through UPI.
+  function upiPlanCards(plans, U, acct) {
+    const paid = hostingActive(acct.hosting_until);
+    const free = el("div", "card plan" + (paid ? "" : " current"));
+    free.innerHTML = "<h3>" + PLANS[0].name + (paid ? "" : " <span class='badge accent'>Current</span>") + "</h3><div class='price'>₹0</div>";
+    const fu = el("ul"); PLANS[0].feats.forEach((f) => fu.append(el("li", "", svg("check", "sm") + "<span>" + esc(f) + "</span>")));
+    free.append(fu);
+    const fb = K.btn(paid ? "Included" : "Current plan", {}); fb.disabled = true; free.append(fb);
+    plans.append(free);
+    U.offers.forEach((o) => {
+      const forever = o.period_days >= 3650, haveLifetime = isLifetime(acct.hosting_until);
+      const card = el("div", "card plan");
+      card.innerHTML = "<h3>" + esc(o.name) + (forever ? " <span class='badge live'>Best value</span>" : "") + "</h3><div class='price'>" + esc(money(o.amount).replace(/\.00$/, "")) + "<small>" + esc(forever ? " · pay once" : " / " + durationLabel(o)) + "</small></div>";
+      const ul = el("ul");
+      [o.description, forever ? "Pay once. No renewals, ever." : "Renewing adds " + durationLabel(o) + " to your end date",
+       "No 24-hour limit while it is paid: same live URL, no rebuild", "Up to 100 projects"].forEach((f) => ul.append(el("li", "", svg("check", "sm") + "<span>" + esc(f) + "</span>")));
+      card.append(ul);
+      const label = haveLifetime ? "You have lifetime hosting" : forever ? "Get Lifetime · " + money(o.amount).replace(/\.00$/, "") : paid ? "Renew · " + money(o.amount).replace(/\.00$/, "") : "Upgrade · " + money(o.amount).replace(/\.00$/, "");
+      const btn = K.btn(label, { cls: "accent", onClick: () => startUpiOrder(o.code, btn) });
+      if (haveLifetime) btn.disabled = true;
+      card.append(btn);
+      plans.append(card);
+    });
+    const note = el("div", "callout info");
+    note.innerHTML = svg("info") + "<div><b>Pay with any UPI app</b> (Google Pay, PhonePe, Paytm, BHIM and more). After you pay, enter the transaction ID. Verification takes up to 8 hours, and your plan switches on automatically once it is approved.</div>";
+    return note;
+  }
+  function upiHistoryCard(U) {
+    if (!U.payments || !U.payments.length) return null;
+    const card = el("div", "card"); card.style.marginTop = "16px";
+    card.append(el("div", "card-head", "<div><h3>UPI payments</h3><p>Your payment requests and receipts</p></div>"));
+    const table = el("table", "table");
+    table.innerHTML = "<thead><tr><th>Date</th><th>Plan</th><th>Amount</th><th>Status</th><th></th></tr></thead>";
+    const tb = el("tbody");
+    U.payments.filter((p) => p.status !== "cancelled").forEach((p) => {
+      const tr = el("tr");
+      tr.innerHTML = "<td>" + esc(new Date(p.created_at).toLocaleString()) + "</td><td>" + esc(p.plan_name) + "</td><td>" + esc(money(p.amount)) + "</td><td><span class='badge " + (upiTone[p.status] || "") + "'>" + esc(p.status_label) + "</span></td><td style='text-align:right'></td>";
+      const last = tr.lastChild;
+      if (p.status === "approved") last.append(Object.assign(el("a", "link small", "Receipt"), { href: "/upi/receipts/" + encodeURIComponent(p.ref), target: "_blank", rel: "noopener" }));
+      else last.append(Object.assign(el("a", "link small", p.status === "submitted" ? "View status" : "Continue"), { href: "#/pay/" + p.ref }));
+      tb.append(tr);
+    });
+    table.append(tb); card.append(table);
+    return card;
+  }
+
+  // The payment page: receipt + "Pay" + "Enter transaction ID" + "Verifying".
+  let payTimer = null;
+  K.route("pay/:ref", async (a) => {
+    clearInterval(payTimer);
+    K.setNav("billing"); skeletonPage();
+    let pay;
+    try { pay = (await Api.get("/api/upi/payments/" + encodeURIComponent(a.ref))).payment; } catch (e) { return showError(e); }
+    K.setNav("billing");
+    K.setCrumbs([{ label: "Usage & Billing", href: "#/billing" }, { label: "Payment " + pay.ref }]);
+    const root = el("div");
+    setView(view(K.pageHead("Complete your payment", "Pay with UPI and enter your transaction ID. Your plan switches on automatically once the payment is verified (up to 8 hours)."), root));
+
+    function steps() {
+      const now = pay.status === "approved" ? 3 : pay.status === "submitted" ? 2 : pay.status === "cancelled" ? -1 : pay.status === "rejected" ? 1 : 0;
+      const ol = el("ol", "pay-steps");
+      ["Pay with UPI", "Transaction ID", "Verification", "Plan active"].forEach((t, i) => {
+        ol.append(el("li", i < now ? "done" : i === now ? "now" : "", "<span class='n'>" + (i < now ? svg("check", "sm") : (i + 1)) + "</span><span class='t'>" + esc(t) + "</span>"));
+      });
+      return ol;
+    }
+    function row(label, value, copyText) {
+      const r = el("div", "rc-row"); r.append(el("span", "k", esc(label)));
+      const v = el("span", "v", value); if (copyText) v.append(copyButton(copyText, label)); r.append(v); return r;
+    }
+    function receiptCard() {
+      const c = el("div", "card receipt");
+      c.append(el("div", "card-head", "<div><h3>Order summary</h3><p>Receipt " + esc(pay.ref) + "</p></div><div class='actions'><span class='badge " + (upiTone[pay.status] || "") + "'>" + esc(pay.status_label) + "</span></div>"));
+      const b = el("div", "card-pad rc");
+      b.append(row("Order reference", "<b class='mono'>" + esc(pay.ref) + "</b>", pay.ref));
+      b.append(row("Billed to", esc(pay.user_name)));
+      b.append(row("Plan", esc(pay.plan_name)));
+      b.append(row("Hosting period", esc(durationLabel(pay))));
+      b.append(row("Pay to", "Codeskys <span class='muted'>· " + esc(pay.upi_id || State.upiId || "UPI") + "</span>"));
+      if (pay.utr) b.append(row("Transaction ID", "<b class='mono'>" + esc(pay.utr) + "</b>"));
+      if (pay.status === "approved") b.append(row("Hosting active until", pay.period_days >= 3650 ? "Lifetime" : esc(dateTime(pay.entitlement_until))));
+      const total = el("div", "rc-total"); total.innerHTML = "<span>Total to pay</span><b>" + esc(money(pay.amount)) + "</b>"; b.append(total);
+      b.append(el("p", "muted small", "This is a payment receipt, not a GST tax invoice."));
+      c.append(b);
+      return c;
+    }
+    function actionCard() {
+      const c = el("div", "card pay-action"); const b = el("div", "card-pad"); c.append(b);
+      if (pay.status === "approved") {
+        b.append(el("div", "pay-big ok", svg("check")));
+        b.append(el("h2", "", "Your plan has been successfully upgraded"));
+        b.append(el("p", "muted", pay.period_days >= 3650
+          ? "Thank you. Lifetime hosting is now active on your account. Your projects stay live for life, with no renewals."
+          : "Thank you. Paid hosting is now active until <b>" + esc(dateTime(pay.entitlement_until)) + "</b>. Your live projects have been extended automatically, with the same links and no rebuild."));
+        const act = el("div", "pay-actions");
+        act.append(K.btn("Go to dashboard", { cls: "accent", icon: "overview", href: "#/" }),
+                   K.btn("View deployments", { icon: "deployments", href: "#/deployments" }),
+                   K.btn("Download receipt", { cls: "ghost", icon: "book", href: "/upi/receipts/" + encodeURIComponent(pay.ref) }));
+        b.append(act); return c;
+      }
+      if (pay.status === "submitted") {
+        b.append(el("div", "pay-big wait", svg("clock")));
+        b.append(el("h2", "", "Payment verification in progress"));
+        b.append(el("p", "muted", "Thank you. We have received your transaction ID <b class='mono'>••••••••" + esc((pay.utr || "").slice(-4)) + "</b>. Verification takes <b>up to 8 hours</b>. Your plan activates automatically as soon as it is approved, and you can safely close this page."));
+        const tl = el("ul", "pay-timeline");
+        tl.innerHTML = "<li class='done'>" + svg("check", "sm") + "<span>Transaction ID received <small>" + esc(timeAgo(pay.submitted_at)) + "</small></span></li><li class='now'><i></i><span>Verification in progress <small>up to 8 hours</small></span></li><li><i></i><span>Plan activated</span></li>";
+        b.append(tl);
+        const act = el("div", "pay-actions");
+        const chk = K.btn("Check status", { cls: "ghost", icon: "refresh", onClick: async () => { spin(chk, "Checking…"); await poll(true); unspin(chk); } });
+        act.append(chk, K.btn("Back to billing", { href: "#/billing" })); b.append(act); return c;
+      }
+      if (pay.status === "cancelled") {
+        b.append(el("h2", "", "This payment request was replaced"));
+        b.append(el("p", "muted", "You started a newer payment request. Open it from the Billing page."));
+        b.append(K.btn("Back to billing", { cls: "accent", href: "#/billing" })); return c;
+      }
+      if (pay.status === "rejected") {
+        const w = el("div", "callout bad"); w.style.marginBottom = "16px";
+        w.innerHTML = svg("alert") + "<div><b>We couldn’t verify this payment.</b> " + esc(pay.note || "") + " Check the transaction ID and enter it again. You have " + pay.attempts_left + " " + (pay.attempts_left === 1 ? "try" : "tries") + " left.</div>";
+        b.append(w);
+      }
+      // Step 1: pay (the QR code sits at the top right, so a computer user can scan it with their phone)
+      const s1 = el("div", "pay-step"); s1.innerHTML = "<span class='n'>1</span><div><h3>Pay " + esc(money(pay.amount)) + " with your UPI app</h3><p class='muted'>On a phone this opens your UPI app with the amount already filled in.</p></div>";
+      const s1head = el("div", "pay-s1head"); s1head.append(s1);
+      const qrFile = { 51000: "upi-qr-510.png", 159900: "upi-qr-1599.png" }[pay.amount];
+      if (qrFile) {
+        const qr = el("button", "pay-qr", "<img src='/static/images/" + qrFile + "' alt='UPI QR code for " + esc(money(pay.amount)) + "' width='128' height='128'><span>" + svg("scan", "sm") + " Scan to pay</span>");
+        qr.type = "button"; qr.title = "Click to enlarge";
+        qr.onclick = () => {
+          const m = el("div", "qr-modal");
+          m.innerHTML = "<img src='/static/images/" + qrFile + "' alt='UPI QR code' width='300' height='300'><p><b>" + esc(money(pay.amount)) + "</b> to Codeskys</p><p class='muted small'>Open Google Pay, PhonePe, Paytm or any UPI app on your phone, tap <b>Scan</b>, and pay. Then enter your transaction ID on this page.</p>";
+          openModal({ title: "Scan to pay with any UPI app", body: m, foot: [K.btn("Close", { cls: "ghost", onClick: closeLayer })] });
+        };
+        s1head.append(qr);
+      }
+      b.append(s1head);
+      const methods = el("div", "pay-methods");
+      const pl = document.createElement("a"); pl.className = "btn accent lg block"; pl.href = pay.pay_link;
+      pl.innerHTML = svg("bolt", "sm") + "<span>Pay " + esc(money(pay.amount)) + " with UPI</span>";
+      const nb = el("button", "btn lg block", svg("billing", "sm") + "<span>Pay with Net Banking</span>"); nb.type = "button";
+      nb.onclick = () => {
+        const m = el("div"); m.innerHTML = "<div class='callout bad'>" + svg("alert") + "<div><b>Net Banking is not available for your account.</b> This payment option is available only for international customers. Customers in India can pay instantly and securely with UPI.</div></div>";
+        openModal({ title: "Net Banking unavailable", body: m, foot: [K.btn("Pay with UPI instead", { cls: "accent", href: pay.pay_link, onClick: closeLayer }), K.btn("Close", { cls: "ghost", onClick: closeLayer })] });
+      };
+      methods.append(pl, nb); b.append(methods);
+      b.append(el("p", "muted small pay-mobile", svg("info", "sm") + "<span>UPI payment links work on mobile phones with a UPI app installed (Google Pay, PhonePe, Paytm, BHIM). On a computer, scan the QR code with your phone, or use the UPI ID below.</span>"));
+      const alt = el("div", "pay-alt");
+      alt.append(row("UPI ID", "<b class='mono'>" + esc(pay.upi_id) + "</b>", pay.upi_id));
+      alt.append(row("Amount", "<b>" + esc(money(pay.amount)) + "</b>"));
+      alt.append(row("Note / remark", "<b class='mono'>" + esc(pay.ref) + "</b>"));
+      b.append(alt);
+      // Share or copy the payment link (to pay from another phone).
+      const shareText = "Pay " + money(pay.amount) + " to Codeskys via UPI. UPI ID: " + pay.upi_id + " · Reference: " + pay.ref + " · Payment link (open on a phone): " + pay.pay_link;
+      const share = el("div", "pay-share");
+      share.append(el("span", "muted small", "Pay from another phone:"));
+      const sb = el("div", "pay-share-btns");
+      const mkS = (label, icon, fn) => { const x = el("button", "btn sm ghost", svg(icon, "sm") + "<span>" + esc(label) + "</span>"); x.type = "button"; x.onclick = fn; return x; };
+      sb.append(
+        mkS("Copy link", "copy", () => navigator.clipboard.writeText(pay.pay_link).then(() => toast("Payment link copied")).catch(() => toast("Couldn’t copy the link.", "error"))),
+        mkS("WhatsApp", "link", () => window.open("https://wa.me/?text=" + encodeURIComponent(shareText), "_blank", "noopener,noreferrer")),
+        mkS("Email", "link", () => { location.href = "mailto:?subject=" + encodeURIComponent("Codeskys payment " + pay.ref) + "&body=" + encodeURIComponent(shareText); }));
+      if (navigator.share) sb.append(mkS("More…", "link", () => navigator.share({ title: "Codeskys payment", text: shareText }).catch(() => {})));
+      share.append(sb); b.append(share);
+      // Step 2: transaction ID
+      const s2 = el("div", "pay-step"); s2.style.marginTop = "22px";
+      s2.innerHTML = "<span class='n'>2</span><div><h3>Enter your transaction ID</h3><p class='muted'>After paying, open the payment in your UPI app and copy the 12-digit <b>UPI Ref No.</b> (also shown as <b>UTR</b> or <b>Transaction ID</b>). Verification takes up to 8 hours.</p></div>";
+      b.append(s2);
+      const f = el("div", "field"); f.style.marginTop = "10px";
+      const ti = el("input", "input mono otp-like"); ti.placeholder = "12-digit transaction ID"; ti.inputMode = "numeric"; ti.maxLength = 14; ti.autocomplete = "off";
+      ti.addEventListener("input", () => { ti.value = ti.value.replace(/\D/g, "").slice(0, 12); err.textContent = ""; });
+      const err = el("div", "name-msg bad");
+      f.append(ti, err); b.append(f);
+      const sub = el("button", "btn accent lg block", "Submit");
+      sub.onclick = async () => {
+        if (ti.value.length !== 12) { err.textContent = "Enter the 12-digit transaction ID from your UPI app."; ti.focus(); return; }
+        spin(sub, "Submitting…");
+        try {
+          const r = await Api.post("/api/upi/payments/" + encodeURIComponent(pay.ref) + "/submit", { utr: ti.value });
+          pay = r.payment; toast("Submitted. We’ll verify it shortly."); paint(); startPolling();
+        } catch (e) { err.textContent = e.message; unspin(sub); }
+      };
+      ti.addEventListener("keydown", (e) => { if (e.key === "Enter") sub.click(); });
+      b.append(sub);
+      b.append(el("p", "muted small", "Entered it wrongly? You can submit it again. Never share your UPI PIN with anyone; Codeskys will never ask for it."));
+      return c;
+    }
+    function paint() {
+      clear(root);
+      const grid = el("div", "pay-grid"); grid.append(receiptCard(), actionCard());
+      root.append(steps(), grid);
+    }
+    async function poll(manual) {
+      try {
+        const r = await Api.get("/api/upi/payments/" + encodeURIComponent(pay.ref));
+        if (r.payment.status !== pay.status) {
+          pay = r.payment; clearInterval(payTimer); paint();
+          if (pay.status === "approved") { toast("Payment approved. Your plan is active."); K.refreshNotifBadge && K.refreshNotifBadge(); }
+          else if (pay.status === "rejected") toast("We couldn’t verify that payment.", "error");
+        } else if (manual) toast("Still verifying. We’ll update this page as soon as it’s approved.");
+      } catch (_) { /* keep the last state */ }
+    }
+    function startPolling() {
+      clearInterval(payTimer);
+      if (pay.status !== "submitted") return;
+      payTimer = setInterval(() => { if (!location.hash.startsWith("#/pay/")) { clearInterval(payTimer); return; } poll(false); }, 8000);
+    }
+    paint(); startPolling();
+  });
+
+  // The short administrator page: payments waiting for approval, the sheet, nothing else.
+  K.route("payments", async () => {
+    K.setNav("payments"); skeletonPage();
+    K.setCrumbs([{ label: "Payments" }]);
+    let filter = "submitted", data;
+    const body = el("div");
+    const dl = K.btn("Download Excel sheet", { cls: "ghost", icon: "billing", href: "/api/admin/upi/export.csv" });
+    setView(view(K.pageHead("Payments", "Check each payment in your bank app, then approve it. Every payment is also saved to the Excel sheet.", [dl]), body));
+    K.setNav("payments");
+    async function load() {
+      try { data = await Api.get("/api/admin/upi?status=" + filter); } catch (e) { return showError(e); }
+      paint();
+    }
+    function approve(p) {
+      const b = el("div");
+      b.innerHTML = "<p class='muted'>Open your bank or UPI app and confirm that this payment really arrived:</p><div class='link-change'><div><span class='muted small'>Amount</span><code>" + esc(money(p.amount)) + "</code></div><div><span class='muted small'>UPI transaction ID</span><code>" + esc(p.utr) + "</code></div><div><span class='muted small'>Paid by</span><code>" + esc(p.user_name) + " · " + esc(p.user_email) + "</code></div></div><p class='muted small' style='margin-top:12px'>Approving switches on " + esc(p.plan_name) + " for this person straight away.</p>";
+      confirmModal({ title: "Approve this payment?", body: b, confirmLabel: "Yes, I received it. Approve", onConfirm: async () => { await Api.post("/api/admin/upi/" + encodeURIComponent(p.ref) + "/approve"); toast("Approved. " + p.user_name + " now has paid hosting."); await load(); } });
+    }
+    function reject(p) {
+      const b = el("div"); b.innerHTML = "<p class='muted'>Tell " + esc(p.user_name) + " what to fix. They can enter the transaction ID again.</p>";
+      const f = el("div", "field"); f.innerHTML = "<label>Reason</label>"; const i = el("input", "input"); i.placeholder = "e.g. Amount not received. Check the transaction ID"; i.maxLength = 200; f.append(i); b.append(f);
+      confirmModal({ title: "Reject this payment?", body: b, confirmLabel: "Reject", danger: true, onConfirm: async () => { await Api.post("/api/admin/upi/" + encodeURIComponent(p.ref) + "/reject", { note: i.value }); toast("Rejected. The person has been told."); await load(); } });
+    }
+    function paint() {
+      clear(body);
+      const c = data.counts || {};
+      const tabs = el("div", "tabs");
+      [["submitted", "To verify", c.submitted || 0], ["approved", "Approved", c.approved || 0], ["rejected", "Rejected", c.rejected || 0], ["all", "All", null]].forEach(([id, label, n]) => {
+        const t = el("a", filter === id ? "on" : "", esc(label) + (n === null ? "" : " <span class='count" + (id === "submitted" && n ? " hot" : "") + "'>" + n + "</span>"));
+        t.href = "#/payments"; t.onclick = (e) => { e.preventDefault(); filter = id; load(); };
+        tabs.append(t);
+      });
+      body.append(tabs);
+      const card = el("div", "card");
+      if (!data.payments.length) { card.append(emptyState("check", filter === "submitted" ? "Nothing to verify" : "No payments here", filter === "submitted" ? "New payments appear here as soon as someone submits a transaction ID." : "Payments will be listed here.")); body.append(card); return; }
+      const table = el("table", "table");
+      table.innerHTML = "<thead><tr><th>Submitted</th><th>Person</th><th>Plan</th><th>Amount</th><th>Transaction ID</th><th>Status</th><th></th></tr></thead>";
+      const tb = el("tbody");
+      data.payments.forEach((p) => {
+        const tr = el("tr");
+        tr.innerHTML = "<td>" + esc(dateTime(p.submitted_at || p.created_at)) + "</td><td><b>" + esc(p.user_name) + "</b><div class='muted small'>" + esc(p.user_email) + "</div></td><td>" + esc(p.plan_name) + "</td><td>" + esc(money(p.amount)) + "</td><td class='mono'>" + esc(p.utr || "—") + "</td><td><span class='badge " + (upiTone[p.status] || "") + "'>" + esc(p.status_label) + "</span>" + (p.note ? "<div class='muted small'>" + esc(p.note) + "</div>" : "") + "</td><td style='text-align:right;white-space:nowrap'></td>";
+        const last = tr.lastChild;
+        if (p.status === "submitted") { last.append(K.btn("Approve", { cls: "accent sm", icon: "check", onClick: () => approve(p) }), document.createTextNode(" "), K.btn("Reject", { cls: "sm", onClick: () => reject(p) })); }
+        tb.append(tr);
+      });
+      table.append(tb); card.append(table); body.append(card);
+    }
+    await load();
+  });
+
 
   function loadCheckoutJs() {
     if (window.Razorpay) return Promise.resolve();
@@ -2596,6 +3182,10 @@
     initChrome();
     try { State.status = await Api.get("/api/platform/status"); } catch (_) { State.status = {}; }
     buildSidebar();
+    // Keep regular users' screens free of internal warnings (see softenWarnings).
+    let softenQueued = false;
+    new MutationObserver(() => { if (softenQueued) return; softenQueued = true; requestAnimationFrame(() => { softenQueued = false; softenWarnings(document.body); }); })
+      .observe(document.body, { childList: true, subtree: true });
     window.addEventListener("hashchange", () => { stopPoll(); K.render(); });
     await K.render();
     refreshNotifBadge();

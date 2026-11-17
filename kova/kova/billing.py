@@ -43,20 +43,32 @@ from .ratelimit import rate_limit
 
 bp = Blueprint("billing", __name__)
 
-# The public offer on the landing page: "STUDENT PLAN ₹500 / 6 months".
+# The public offers (landing page and billing screen): ₹510 for 6 months, ₹1,599 for lifetime.
 # It grants the existing "pro" plan limits. Change it with KOVA_BILLING_PLANS_JSON,
 # not by editing code. Amounts are in paise.
 DEFAULT_CATALOG = {
-    "student-6m": {
-        "name": "Student",
-        "grants_plan": "pro",
-        "amount": 50000,
+    # The owner's final prices. Both are "paid hosting": they set users.hosting_until, so every
+    # deployment stays live until the paid period ends (+24 h grace) instead of expiring after
+    # 24 hours, and the person may have many projects. Lifetime is a hosting date 100 years out.
+    "hosting-6m": {
+        "name": "Paid Hosting · 6 months",
+        "grants_plan": "hosting",
+        "amount": 51000,
         "currency": "INR",
         "period_days": 180,
-        "description": "Codeskys Student plan, 6 months",
+        "description": "Keep your projects live for 6 months",
+    },
+    "hosting-lifetime": {
+        "name": "Lifetime Hosting",
+        "grants_plan": "hosting",
+        "amount": 159900,
+        "currency": "INR",
+        "period_days": 36500,
+        "description": "Keep your projects live for life, with a single payment",
     },
 }
 SELLABLE_PLANS = {"pro", "team", "premium"}
+HOSTING = "hosting"          # grants_plan of a paid-hosting offer: extends users.hosting_until, not the plan
 CURRENCIES = {"INR"}
 WEBHOOK_MAX_BYTES = 256 * 1024
 WEBHOOK_MAX_AGE_S = 3 * 24 * 3600   # Razorpay retries for ~24 h; older bodies are replays
@@ -123,10 +135,10 @@ class BillingConfig:
                 out.append(f"plan {code!r}: amount must be an integer >= 100 (paise)")
             if p.get("currency") not in CURRENCIES:
                 out.append(f"plan {code!r}: currency must be INR")
-            if p.get("grants_plan") not in SELLABLE_PLANS:
-                out.append(f"plan {code!r}: grants_plan must be one of {sorted(SELLABLE_PLANS)}")
-            if not isinstance(p.get("period_days"), int) or not 1 <= p["period_days"] <= 3660:
-                out.append(f"plan {code!r}: period_days must be 1..3660")
+            if p.get("grants_plan") not in SELLABLE_PLANS | {HOSTING}:
+                out.append(f"plan {code!r}: grants_plan must be one of {sorted(SELLABLE_PLANS | {HOSTING})}")
+            if not isinstance(p.get("period_days"), int) or not 1 <= p["period_days"] <= 36500:
+                out.append(f"plan {code!r}: period_days must be 1..36500")
         return out
 
     @property
@@ -221,7 +233,8 @@ def _user_plan_state(user) -> dict:
     keys = user.keys()
     exp = user["plan_expires_at"] if "plan_expires_at" in keys else None
     return {"plan": user["plan"], "plan_expires_at": exp,
-            "managed_by_admin": user["plan"] != "hobby" and not exp}
+            "managed_by_admin": user["plan"] != "hobby" and not exp,
+            "hosting_until": user["hosting_until"] if "hosting_until" in keys else None}
 
 
 # ------------------------------------------------------------------ state transitions
@@ -235,6 +248,9 @@ def _grant(db, pay) -> None:
         return  # already granted (or revoked) by an earlier event
     user = db.execute("SELECT * FROM users WHERE id = ?", (pay["user_id"],)).fetchone()
     now = _now()
+    if pay["grants_plan"] == HOSTING:
+        _grant_hosting(db, pay, user, now)
+        return
     current_exp = _parse(user["plan_expires_at"])
     start = current_exp if (user["plan"] == pay["grants_plan"] and current_exp and current_exp > now) else now
     until = _iso(start + timedelta(days=pay["period_days"]))
@@ -246,8 +262,26 @@ def _grant(db, pay) -> None:
         return
     db.execute("UPDATE users SET plan = ?, plan_expires_at = ? WHERE id = ?", (pay["grants_plan"], until, user["id"]))
     db.execute("UPDATE payments SET entitlement_until = ? WHERE id = ?", (until, pay["id"]))
+    from . import plans
+    plans.apply_plan_to_live_projects(db, user["id"])   # what is live now lasts as long as the plan
     audit("billing.plan_granted", actor_id=user["id"], target=pay["ref"], detail=f"{pay['grants_plan']} until {until}")
     _log("plan_granted", ref=pay["ref"], plan=pay["grants_plan"], until=until)
+
+
+def _grant_hosting(db, pay, user, now) -> None:
+    """30 days of paid hosting from now, or from the current end while it is still running (renewal).
+    The live deployments are extended in the same transaction (engine.extend_for_hosting)."""
+    from . import engine
+    current = _parse(user["hosting_until"])
+    until = _iso((current if current and current > now else now) + timedelta(days=pay["period_days"]))
+    db.execute("UPDATE users SET hosting_until = ? WHERE id = ?", (until, user["id"]))
+    db.execute("UPDATE payments SET entitlement_until = ? WHERE id = ?", (until, pay["id"]))
+    kept = engine.extend_for_hosting(db, user["id"])
+    audit("billing.hosting_granted", actor_id=user["id"], target=pay["ref"], detail=f"hosting until {until}, {kept} live")
+    _log("hosting_granted", ref=pay["ref"], until=until, deployments=kept)
+    engine._notify(db, user["id"], "billing", "Paid hosting active",
+                   f"Your deployments stay live until {until[:16].replace('T', ' ')} UTC, plus 24 hours of grace. "
+                   "Renew before then to keep them running.", "#/billing")
 
 
 def _revoke(db, pay) -> None:
@@ -257,6 +291,9 @@ def _revoke(db, pay) -> None:
     if cur.rowcount != 1 or not pay["entitlement_until"]:
         return
     user = db.execute("SELECT * FROM users WHERE id = ?", (pay["user_id"],)).fetchone()
+    if pay["grants_plan"] == HOSTING:
+        _revoke_hosting(db, pay, user)
+        return
     exp = _parse(user["plan_expires_at"])
     if user["plan"] != pay["grants_plan"] or exp is None:
         return
@@ -267,6 +304,22 @@ def _revoke(db, pay) -> None:
         db.execute("UPDATE users SET plan_expires_at = ? WHERE id = ?", (_iso(new_exp), user["id"]))
     audit("billing.plan_revoked", actor_id=user["id"], target=pay["ref"], detail="full refund")
     _log("plan_revoked", ref=pay["ref"])
+
+
+def _revoke_hosting(db, pay, user) -> None:
+    """Full refund of paid hosting: take its 30 days back. Live deployments then follow the same
+    policy as an ended period: they stay up for the 24 h grace (from now at the latest), then expire."""
+    from . import engine
+    current = _parse(user["hosting_until"])
+    if current is None:
+        return
+    new_until = current - timedelta(days=pay["period_days"])
+    db.execute("UPDATE users SET hosting_until = ? WHERE id = ?", (_iso(new_until), user["id"]))
+    latest = _iso(max(new_until, _now()) + engine.HOSTING_GRACE)
+    db.execute("UPDATE deployments SET expires_at = ? WHERE status = 'ready' AND expired_at IS NULL AND expires_at > ? "
+               "AND project_id IN (SELECT id FROM projects WHERE owner_id = ?)", (latest, latest, user["id"]))
+    audit("billing.hosting_revoked", actor_id=user["id"], target=pay["ref"], detail="full refund")
+    _log("hosting_revoked", ref=pay["ref"])
 
 
 def _mark_paid(db, pay, payment_id: str, source: str) -> None:
@@ -369,10 +422,13 @@ def create_order():
     if plan is None:
         return jsonify(error="Unknown plan."), 422
     state = _user_plan_state(user)
-    if state["managed_by_admin"]:
-        return jsonify(error="Your plan is managed by an administrator. Contact them to change it."), 409
-    if user["plan"] not in ("hobby", plan["grants_plan"]):
-        return jsonify(error=f"You already have an active {user['plan'].title()} plan."), 409
+    if plan["grants_plan"] == HOSTING and user["hosting_until"] and int(user["hosting_until"][:4]) >= 2100:
+        return jsonify(error="You already have lifetime hosting. Nothing more to buy."), 409
+    if plan["grants_plan"] != HOSTING:              # paid hosting does not change the plan: any plan may buy it
+        if state["managed_by_admin"]:
+            return jsonify(error="Your plan is managed by an administrator. Contact them to change it."), 409
+        if user["plan"] not in ("hobby", plan["grants_plan"]):
+            return jsonify(error=f"You already have an active {user['plan'].title()} plan."), 409
 
     ref = "pay_" + secrets.token_hex(8)
     try:

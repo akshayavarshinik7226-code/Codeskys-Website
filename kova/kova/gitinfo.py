@@ -37,7 +37,14 @@ FRAMEWORKS = {
     "streamlit": {"name": "Python (Streamlit)", "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "streamlit run app.py --server.port 8000 --server.address 0.0.0.0 --server.headless true", "port": 8000, "static": False},
     "fastapi":  {"name": "Python (FastAPI)", "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "uvicorn main:app --host 0.0.0.0 --port 8000", "port": 8000, "static": False},
     "django":   {"name": "Python (Django)", "install": "pip install -r requirements.txt", "build": "python manage.py collectstatic --noinput", "output": "", "start": "gunicorn config.wsgi -b 0.0.0.0:8000", "port": 8000, "static": False},
+    "gradio":   {"name": "Python (Gradio)", "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "python app.py", "port": 7860, "static": False},
+    "dash":     {"name": "Python (Plotly Dash)", "install": "pip install -r requirements.txt", "build": "", "output": "", "start": "python app.py", "port": 8050, "static": False},
+    "nestjs":   {"name": "NestJS",          "install": "npm install", "build": "npm run build", "output": "",        "start": "node dist/main", "port": 3000, "static": False},
     "docker":   {"name": "Dockerfile",      "install": "",            "build": "",              "output": "",        "start": "",            "port": 3000, "static": False},
+    # The repository's own docker-compose file: several services (web, API, worker, database).
+    "compose":  {"name": "Docker Compose (multi-service)", "install": "", "build": "", "output": "",   "start": "",            "port": 3000, "static": False},
+    # No web application: a read-only page of the project's notebooks and README.
+    "docs":     {"name": "Notebook & docs preview", "install": "", "build": "",          "output": "",        "start": "",            "port": 80,   "static": True},
     "static":   {"name": "Static HTML",     "install": "",            "build": "",              "output": "",        "start": "",            "port": 80,   "static": True},
 }
 
@@ -99,6 +106,11 @@ def resolve_tree(info: dict, timeout: float = 6.0, token: str | None = None, loo
             return parts[0], ""
         raise GitError("Codeskys could not check that folder link. Enter the repository link "
                        "(https://github.com/owner/repo), then choose the branch and root directory.")
+    refs = smart_refs(info["full_name"], max(timeout, 10.0)) if info.get("provider") == "github" else None
+    if refs:                                    # a public repository: every branch in one request, no API
+        for i in range(len(parts), 0, -1):
+            if f"refs/heads/{'/'.join(parts[:i])}" in refs:
+                return "/".join(parts[:i]), clean_root_dir("/".join(parts[i:]))
     try:
         for i in range(len(parts), 0, -1):
             branch = "/".join(parts[:i])
@@ -129,7 +141,7 @@ def detect_framework(pkg: dict | None, files: set, requirements: str = "") -> st
         return "docker"
     if pkg:
         deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-        for dep, fw in (("next", "nextjs"), ("nuxt", "nuxt"), ("@sveltejs/kit", "svelte"),
+        for dep, fw in (("next", "nextjs"), ("nuxt", "nuxt"), ("@sveltejs/kit", "svelte"), ("@nestjs/core", "nestjs"),
                         ("@angular/core", "angular"), ("astro", "astro"), ("gatsby", "gatsby"),
                         ("react-scripts", "cra")):
             if dep in deps:
@@ -149,6 +161,10 @@ def detect_framework(pkg: dict | None, files: set, requirements: str = "") -> st
         return "fastapi"
     if "streamlit" in reqs and "flask" not in reqs:
         return "streamlit"
+    if "gradio" in reqs and "flask" not in reqs:
+        return "gradio"
+    if "dash" in reqs:
+        return "dash"           # Dash runs on Flask, so requirements often list both
     if "requirements.txt" in files or "app.py" in files:
         return "flask"
     return "static"
@@ -205,8 +221,8 @@ def _inspect_github(info, result, timeout, token):
     if r.status_code == 401:
         raise GitError("GitHub rejected the stored token. Reconnect your GitHub account.")
     if r.status_code != 200:
-        result["reachable"] = False
-        return result
+        # Usually the API's hourly limit for this server (403/429): detect without the API.
+        return _inspect_github_raw(info, result, timeout)
     meta = r.json()
     linked = info.get("tree_path")
     result.update(default_branch=result["default_branch"] if linked else (meta.get("default_branch") or "main"),
@@ -222,6 +238,9 @@ def _inspect_github(info, result, timeout, token):
     ref = quote(result["default_branch"], safe="")
     base = f"/repos/{info['full_name']}/contents" + (f"/{result['root_dir']}" if result["root_dir"] else "")
     tree = _gh(f"{base}?ref={ref}", timeout, token)
+    if tree.status_code in (403, 429) and not result["private"]:
+        # The hourly API limit ran out between two calls: finish the detection without the API.
+        return _inspect_github_raw(info, result, timeout, branch=result["default_branch"])
     files = set()
     if tree.status_code == 200 and isinstance(tree.json(), list):
         files = {f["name"] for f in tree.json()}
@@ -241,7 +260,24 @@ def _inspect_github(info, result, timeout, token):
                 reqs = base64.b64decode(rr.json().get("content", "")).decode("utf-8", "replace")[:20000]
             except ValueError:
                 reqs = ""
-    result["framework"] = detect_framework(pkg, files, reqs)
+    from .projectscan import choose
+    cache = {"package.json": json.dumps(pkg) if pkg is not None else None, "requirements.txt": reqs or None}
+
+    def read(name):
+        if name not in cache:
+            cache[name] = None
+            if name in files:
+                fr = _gh(f"{base}/{name}?ref={ref}", timeout, token)
+                if fr.status_code == 200:
+                    try:
+                        cache[name] = base64.b64decode(fr.json().get("content", "")).decode("utf-8", "replace")[:65536]
+                    except ValueError:
+                        pass
+        return cache[name]
+    # Docker Compose with several services, a notebook/README-only project, or one framework.
+    result["framework"] = choose(files, read) or "static"
+    if result["framework"] in ("docs", "static") and not result["private"]:
+        _detect_in_folder(info, result)
     result["files"] = sorted(files)[:40]
     cm = _gh(f"/repos/{info['full_name']}/commits/{quote(result['default_branch'], safe='/')}", timeout, token)
     if cm.status_code == 200:
@@ -318,9 +354,52 @@ def latest_commit(full_name: str, branch: str, timeout: float = 6.0, token: str 
     return None
 
 
-def branch_head(full_name: str, branch: str, timeout: float = 10.0) -> str | None:
-    """The commit a public GitHub branch points to, read like ``git ls-remote`` (smart HTTP)."""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name or "") or not branch:
+# Files that decide the framework, probed one by one on raw.githubusercontent.com.
+RAW_PROBES = ("package.json", "requirements.txt", "Dockerfile", "manage.py", "pyproject.toml", "docker-compose.yml",
+              "docker-compose.yaml", "compose.yml", "compose.yaml", "index.html", "app.py", "main.py",
+              "streamlit_app.py", "README.md")
+
+
+def default_branch(full_name: str, timeout: float = 10.0) -> str | None:
+    """A public GitHub repository's default branch from the smart-HTTP handshake (no API call)."""
+    return (smart_refs(full_name, timeout) or {}).get("HEAD->")
+
+
+def _inspect_github_raw(info, result, timeout, branch=None):
+    """Detection when the GitHub API is unavailable: the marker files are read from
+    raw.githubusercontent.com, which has no hourly limit. Only public repositories."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .projectscan import choose
+    if not branch:
+        branch = result["default_branch"] if info.get("tree_path") else default_branch(info["full_name"], timeout)
+    if not branch:
+        result["reachable"] = False
+        return result
+    result.update(default_branch=branch, branches=[branch], reachable=True)
+    prefix = f"{result['root_dir']}/" if result["root_dir"] else ""
+
+    def get(name):
+        url = f"https://raw.githubusercontent.com/{info['full_name']}/{quote(branch, safe='/')}/{prefix}{name}"
+        try:
+            r = requests.get(url, timeout=timeout, allow_redirects=False)
+        except requests.RequestException:
+            return name, None
+        return name, (r.text[:65536] if r.status_code == 200 else None)
+    with ThreadPoolExecutor(8) as pool:
+        found = {n: t for n, t in pool.map(get, RAW_PROBES) if t is not None}
+    result["framework"] = choose(set(found), found.get) or "static"
+    if result["framework"] in ("docs", "static"):
+        _detect_in_folder(info, result)
+    result["files"] = sorted(found)
+    result["detected_without_api"] = True
+    return result
+
+
+def smart_refs(full_name: str, timeout: float = 10.0) -> dict | None:
+    """``{ref: sha}`` of a public GitHub repository, read like ``git ls-remote`` (smart HTTP, no API
+    call); the key ``"HEAD->"`` holds the default branch's name. None when it cannot be read."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name or ""):
         return None
     try:
         r = requests.get(f"https://github.com/{full_name}.git/info/refs", params={"service": "git-upload-pack"},
@@ -330,7 +409,7 @@ def branch_head(full_name: str, branch: str, timeout: float = 10.0) -> str | Non
         return None
     if r.status_code != 200:
         return None
-    data, pos, want = r.content[:2_000_000], 0, f"refs/heads/{branch}".encode()
+    data, pos, refs = r.content[:2_000_000], 0, {}
     while pos + 4 <= len(data):
         try:
             size = int(data[pos:pos + 4], 16)
@@ -339,9 +418,43 @@ def branch_head(full_name: str, branch: str, timeout: float = 10.0) -> str | Non
         if size == 0:                       # flush packet
             pos += 4
             continue
-        line = data[pos + 4:pos + size].split(b"\0", 1)[0].rstrip(b"\n")
+        line, _, caps = data[pos + 4:pos + size].rstrip(b"\n").partition(b"\0")
         pos += size
+        head = re.search(rb"symref=HEAD:refs/heads/(\S{1,200})", caps)
+        if head:
+            refs["HEAD->"] = head.group(1).decode("utf-8", "replace")
         sha, _, ref = line.partition(b" ")
-        if ref == want and re.fullmatch(rb"[0-9a-f]{40}", sha):
-            return sha.decode()
-    return None
+        if re.fullmatch(rb"[0-9a-f]{40}", sha):
+            refs[ref.decode("utf-8", "replace")] = sha.decode()
+    return refs
+
+
+def _detect_in_folder(info, result):
+    """Only docs (a README, notebooks) or nothing at the top: an app one or two folders down (forgeops/
+    holding a compose stack) is what the student deploys, so the form proposes it and its folder.
+    One file-list request (the archive when the API limit is used up); public repositories only."""
+    from .buildpolicy import fetch_file, repository_files
+    from .projectscan import _has_site, detect
+    branch = result["default_branch"]
+    sha = branch_head(info["full_name"], branch)
+    url = f"https://github.com/{info['full_name']}"
+    every = repository_files(url, sha) if sha else None
+    if not every:
+        return
+    root = result["root_dir"].strip("/")
+    files = {f[len(root) + 1:] if root else f for f in every if not root or f.startswith(root + "/")}
+    if result["framework"] == "static" and _has_site(files):
+        return                                                 # a real static site
+    try:
+        framework, sub = detect(files, lambda p: fetch_file(url, sha, f"{root}/{p}" if root else p))
+    except Exception:                                          # detection only proposes; never block the form
+        return
+    if framework and sub:
+        result.update(framework=framework, root_dir="/".join(x for x in (root, sub) if x))
+
+
+def branch_head(full_name: str, branch: str, timeout: float = 10.0) -> str | None:
+    """The commit a public GitHub branch points to, read like ``git ls-remote`` (smart HTTP)."""
+    if not branch:
+        return None
+    return (smart_refs(full_name, timeout) or {}).get(f"refs/heads/{branch}")

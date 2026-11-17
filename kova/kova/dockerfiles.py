@@ -35,7 +35,46 @@ STATIC_PORT = 8080
 
 _PATH = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 _FLAGS = re.compile(r"--(network|security|device)\b", re.I)
-PYTHON_FRAMEWORKS = {"flask", "django", "fastapi", "streamlit"}
+PYTHON_FRAMEWORKS = {"flask", "django", "fastapi", "streamlit", "gradio", "dash"}
+# PyTorch from PyPI bundles CUDA (gigabytes, useless without a GPU). When the requirements name
+# torch, or a package that installs it (ultralytics, sentence-transformers, ...), pip also reads
+# the CPU wheel index; its "+cpu" builds sort above the PyPI ones.
+TORCH_CPU = ("if grep -qiE '^[[:space:]]*(torch|torchvision|torchaudio|ultralytics|sentence[-_]transformers|timm|"
+             "easyocr|openai[-_]whisper|lightning|pytorch[-_]lightning|accelerate|kornia|torchmetrics|torch[-_]geometric)"
+             "([^A-Za-z0-9_.-]|$)' requirements.txt "
+             "2>/dev/null; then export PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu; fi; ")
+DOCS_TOOLS = "pip install nbconvert==7.16.6 markdown==3.7"   # 7.16.4 breaks with mistune 3.1+
+# Renders the project's notebooks (saved outputs only, never executed) and README into /site.
+DOCS_SCRIPT = r"""python - <<'PYEOF'
+import html, pathlib
+import markdown
+from nbconvert import HTMLExporter
+root, out = pathlib.Path('.'), pathlib.Path('/site')
+(out / 'notebooks').mkdir(parents=True, exist_ok=True)
+skip = {'.git', 'node_modules', '.ipynb_checkpoints', '__pycache__', '.venv', 'venv'}
+rows, exporter = [], HTMLExporter()
+for nb in sorted(p for p in root.rglob('*.ipynb') if not skip & set(p.parts))[:200]:
+    name = nb.as_posix()
+    try:
+        body, _ = exporter.from_filename(name)
+    except Exception as exc:
+        rows.append('<li>%s <em>(could not be rendered: %s)</em></li>' % (html.escape(name), html.escape(str(exc)[:120])))
+        continue
+    target = 'notebooks/' + name.replace('/', '__') + '.html'
+    (out / target).write_text(body)
+    rows.append('<li><a href="%s">%s</a></li>' % (html.escape(target), html.escape(name)))
+readme = next((p for p in sorted(root.iterdir()) if p.is_file() and p.name.lower() in ('readme.md', 'readme.markdown', 'readme.txt', 'readme')), None)
+doc = markdown.markdown(readme.read_text(errors='replace'), extensions=['fenced_code', 'tables']) if readme else ''
+page = ('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>Project preview</title><style>body{font:16px/1.6 system-ui,sans-serif;max-width:880px;margin:0 auto;padding:24px}'
+        '.note{background:#fff7e0;border:1px solid #e8c766;padding:10px 14px;border-radius:8px}pre{overflow:auto}'
+        'table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}</style></head><body>'
+        '<p class="note">Documentation preview. This project has no web application to run, so Codeskys shows its '
+        'notebooks (with their saved outputs; nothing was executed) and its README.</p>'
+        + ('<h2>Notebooks</h2><ul>%s</ul>' % ''.join(rows) if rows else '') + doc + '</body></html>')
+(out / 'index.html').write_text(page)
+print('Codeskys preview:', len(rows), 'notebook(s),', 'README' if readme else 'no README')
+PYEOF"""
 # The server a Python start command names, installed only when the repository did not
 # bring its own (many Flask repositories list Flask but not Gunicorn).
 PYTHON_SERVERS = {"gunicorn": "gunicorn==23.0.0", "uvicorn": "uvicorn[standard]==0.32.1",
@@ -76,6 +115,11 @@ def _cmd(cmd: str) -> str:
     return "CMD " + json.dumps(["/bin/sh", "-c", "exec " + cmd])
 
 
+_CLEAR_HTML = "rm -rf /usr/share/nginx/html && mkdir -p /usr/share/nginx/html"
+_NEED_INDEX = ("test -f /usr/share/nginx/html/index.html || { echo 'Codeskys: the site has no index.html at its "
+               "top level, so there is no home page to show.' >&2; exit 1; }")
+
+
 def _find_site(root: str) -> str:
     """Shell script: copy the folder holding index.html to /site. The shallowest one
     wins (Angular 17+ builds into dist/<name>/browser). ``root`` is a validated path."""
@@ -92,6 +136,8 @@ def _find_site(root: str) -> str:
 def settings(project) -> dict:
     """The effective, validated build settings of a framework project."""
     fw_id = project["framework"]
+    if fw_id == "compose":
+        raise DockerfileError("This project is built from its own docker-compose file.")
     if fw_id == "docker" or fw_id not in FRAMEWORKS:
         raise DockerfileError("This framework is built from the repository's own Dockerfile.")
     fw = FRAMEWORKS[fw_id]
@@ -112,7 +158,8 @@ def settings(project) -> dict:
         "static": bool(fw["static"]),
         "port": STATIC_PORT if fw["static"] else int(pick("port", fw["port"])),
         # Python projects and plain static HTML never run Node: their setting is ignored.
-        "node_image": (None if fw_id in PYTHON_FRAMEWORKS or (fw["static"] and not (fw["install"] or fw["build"]))
+        "node_image": (None if fw_id in PYTHON_FRAMEWORKS or fw_id == "docs"
+                       or (fw["static"] and not (fw["install"] or fw["build"]))
                        else _node_image(pick("node_version", DEFAULT_NODE))),
     }
 
@@ -129,6 +176,14 @@ def generate(project) -> tuple[str, int]:
     """Return (Dockerfile text, port the app listens on)."""
     s = settings(project)
     lines = [MARKER + f" for framework '{s['framework']}'. Do not edit: regenerated on every deploy."]
+    if s["framework"] == "docs":
+        lines += [f"FROM {PYTHON_IMAGE} AS build", "WORKDIR /app", "COPY . .",
+                  "ENV PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1",
+                  _run(DOCS_TOOLS), _run(DOCS_SCRIPT), f"FROM {STATIC_IMAGE}",
+                  "COPY --from=build /site /usr/share/nginx/html", "USER root",
+                  _run(f"printf '%s\\n' '{_NGINX_CONF}' > /etc/nginx/conf.d/default.conf"),
+                  "USER 101", f"EXPOSE {STATIC_PORT}"]
+        return "\n".join(lines) + "\n", STATIC_PORT
     if s["static"]:
         if s["install"] or s["build"]:
             lines += [f"FROM {s['node_image']} AS build", "WORKDIR /app", "COPY . .",
@@ -136,9 +191,12 @@ def generate(project) -> tuple[str, int]:
             lines += [_run(s["install"])] if s["install"] else []
             lines += [_run(s["build"])] if s["build"] else []
             lines += [_run(_find_site("/app/" + s["output"] if s["output"] else "/app")),
-                      f"FROM {STATIC_IMAGE}", "COPY --from=build /site /usr/share/nginx/html"]
+                      f"FROM {STATIC_IMAGE}", "USER root", _run(_CLEAR_HTML),
+                      "COPY --from=build /site /usr/share/nginx/html"]
         else:
-            lines += [f"FROM {STATIC_IMAGE}", f"COPY {s['output'] or '.'}/ /usr/share/nginx/html/"]
+            # nginx's own welcome page must never stand in for a site that has no index.html.
+            lines += [f"FROM {STATIC_IMAGE}", "USER root", _run(_CLEAR_HTML),
+                      f"COPY {s['output'] or '.'}/ /usr/share/nginx/html/", _run(_NEED_INDEX)]
         lines += ["USER root",
                   _run(f"printf '%s\\n' '{_NGINX_CONF}' > /etc/nginx/conf.d/default.conf"),
                   "USER 101", f"EXPOSE {STATIC_PORT}"]
@@ -149,7 +207,7 @@ def generate(project) -> tuple[str, int]:
     if s["framework"] in PYTHON_FRAMEWORKS:
         lines += [f"FROM {PYTHON_IMAGE}", "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1",
                   _run("useradd --create-home --uid 10001 app"), "WORKDIR /app", "COPY --chown=10001:10001 . ."]
-        lines += [_run(s["install"])] if s["install"] else []
+        lines += [_run(TORCH_CPU + s["install"])] if s["install"] else []
         server = s["start"].split(maxsplit=1)[0] if s["start"] else ""
         if server in PYTHON_SERVERS:
             lines += [_run(f"python -c 'import {server}' 2>/dev/null || pip install {PYTHON_SERVERS[server]}")]
@@ -161,5 +219,8 @@ def generate(project) -> tuple[str, int]:
         lines += [_run(s["install"])] if s["install"] else []
         lines += [_run(s["build"])] if s["build"] else []
         lines += ["ENV NODE_ENV=production"]
-    lines += [f"ENV PORT={s['port']} HOST=0.0.0.0 HOSTNAME=0.0.0.0", f"EXPOSE {s['port']}", _cmd(s["start"])]
+    env = f"ENV PORT={s['port']} HOST=0.0.0.0 HOSTNAME=0.0.0.0"
+    if s["framework"] in PYTHON_FRAMEWORKS:
+        env += f" GRADIO_SERVER_NAME=0.0.0.0 GRADIO_SERVER_PORT={s['port']}"
+    lines += [env, f"EXPOSE {s['port']}", _cmd(s["start"])]
     return "\n".join(lines) + "\n", s["port"]

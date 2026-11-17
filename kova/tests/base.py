@@ -24,6 +24,7 @@ class AppTestCase(unittest.TestCase):
             "DATABASE": os.path.join(self.tmp, "t.db"),
             "SECRET_KEY": "test-secret",
             "COOLIFY_URL": "", "COOLIFY_TOKEN": "",
+            "ONE_ACCOUNT_PER_BROWSER": False,    # switched on by the tests that exercise it (test_browsers.py)
         })
         conn = connect(self.app.config["DATABASE"])
         self.admin_id = create_user(conn, *ADMIN, role="admin")

@@ -342,6 +342,99 @@ MIGRATIONS = [
     """
     ALTER TABLE deployments ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT '';
     """,
+    # 9: credentials Codeskys generated for the databases it runs inside a project's compose stack
+    #    (encrypted; no API returns them and no log shows them). They live as long as the database:
+    #    removed when the app is torn down (expiry) or the project is deleted.
+    """
+    CREATE TABLE managed_credentials (
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        key TEXT NOT NULL,
+        value_cipher TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, key)
+    );
+    """,
+    # 10: paid hosting (₹510 / 30 days, billing.py). users.hosting_until: the end of the paid period
+    #     (NULL = never paid); deployments then stay live until hosting_until + the 24 h grace.
+    #     hosting_reminded: the hosting_until whose "your paid hosting ended" reminder was sent.
+    """
+    ALTER TABLE users ADD COLUMN hosting_until TEXT;
+    ALTER TABLE users ADD COLUMN hosting_reminded TEXT;
+    """,
+    # 11: the free (Hobby) plan has ONE clock per project, and email-verified sign-up.
+    #    projects.free_expires_at: when the project's single free window ends. Set once, when the
+    #      project first goes live; redeploys never move it. NULL until the first successful deploy.
+    #    users.free_started_at: when this person's free window first started (so deleting an
+    #      expired project and creating another cannot give a second free window).
+    #    pending_signups: a sign-up waiting for its email code. Only a HASH of the code is stored.
+    #    Existing free projects keep the expiry their live deployment already shows.
+    """
+    ALTER TABLE users ADD COLUMN free_started_at TEXT;
+    ALTER TABLE projects ADD COLUMN free_expires_at TEXT;
+    UPDATE projects SET free_expires_at = COALESCE(
+        (SELECT d.expires_at FROM deployments d
+           WHERE d.id = projects.current_deployment_id AND d.expires_at IS NOT NULL),
+        (SELECT d.expires_at FROM deployments d
+           WHERE d.project_id = projects.id AND d.expires_at IS NOT NULL ORDER BY d.id DESC LIMIT 1))
+      WHERE owner_id IN (SELECT id FROM users WHERE plan = 'hobby' AND hosting_until IS NULL);
+    UPDATE users SET free_started_at = (
+        SELECT MIN(d.created_at) FROM deployments d JOIN projects p ON p.id = d.project_id
+          WHERE p.owner_id = users.id AND d.expires_at IS NOT NULL)
+      WHERE plan = 'hobby' AND hosting_until IS NULL;
+    CREATE TABLE pending_signups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        sends INTEGER NOT NULL DEFAULT 1,
+        expires_at TEXT NOT NULL,
+        last_sent_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """,
+    # 12: manual UPI payments. A person picks a plan, pays to the Codeskys UPI ID in their own UPI
+    #     app, then types the 12-digit transaction ID (UTR). An administrator checks the bank app and
+    #     approves; approval sets users.hosting_until exactly like a Razorpay payment does.
+    #     The same transaction ID can only be used once (unique while submitted or approved).
+    """
+    CREATE TABLE upi_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ref TEXT NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        plan_code TEXT NOT NULL,
+        plan_name TEXT NOT NULL,
+        period_days INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        user_name TEXT NOT NULL,
+        user_email TEXT NOT NULL,
+        utr TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'awaiting_payment',
+        note TEXT NOT NULL DEFAULT '',
+        entitlement_until TEXT,
+        created_at TEXT NOT NULL,
+        submitted_at TEXT,
+        decided_at TEXT,
+        decided_by INTEGER
+    );
+    CREATE UNIQUE INDEX upi_utr_in_use ON upi_payments(utr)
+        WHERE utr IS NOT NULL AND status IN ('submitted', 'approved');
+    CREATE INDEX upi_by_user ON upi_payments(user_id, id);
+    """,
+    # 13: one account per browser. A browser gets a random token in a long-lived cookie; the token's hash is
+    #     linked to the first ordinary account used on it. An administrator's browser is flagged and unlimited.
+    """
+    CREATE TABLE browser_links (
+        device_hash TEXT PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        is_admin_device INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+    );
+    CREATE INDEX browser_links_user ON browser_links(user_id);
+    """,
 ]
 
 

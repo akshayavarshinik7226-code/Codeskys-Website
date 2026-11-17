@@ -8,7 +8,7 @@ from flask import Blueprint, jsonify, request
 from .auth import current_user, login_required
 from .db import audit, get_db, utcnow
 from .security import for_student, hash_password, verify_password
-from .users import MIN_PASSWORD, public_user
+from .users import MIN_PASSWORD, ValidationError, check_password, public_user
 
 bp = Blueprint("account", __name__, url_prefix="/api")
 
@@ -40,8 +40,12 @@ def change_password():
     if not verify_password(str(data.get("current", "")), user["password_hash"]):
         return jsonify(error="Your current password is incorrect."), 400
     new = str(data.get("new", ""))
-    if len(new) < MIN_PASSWORD:
-        return jsonify(error=f"New password must be at least {MIN_PASSWORD} characters."), 400
+    try:
+        check_password(new, user["email"])
+    except ValidationError as exc:
+        return jsonify(error=str(exc)), 400
+    if verify_password(new, user["password_hash"]):
+        return jsonify(error="Your new password must be different from your current password."), 400
     db = get_db()
     db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new), user["id"]))
     db.commit()

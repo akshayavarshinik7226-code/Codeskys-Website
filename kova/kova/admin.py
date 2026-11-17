@@ -85,6 +85,9 @@ def edit_user(uid):
     cols = ", ".join(f"{k} = ?" for k in updates)
     db.execute(f"UPDATE users SET {cols} WHERE id = ?", (*updates.values(), uid))
     db.commit()
+    if "plan" in updates:
+        from . import plans
+        plans.apply_plan_to_live_projects(db, uid)   # what is live now lasts as long as the new plan
     audit("user.updated", actor_id=me["id"], target=row["email"],
           detail=", ".join(k for k in updates if k != "password_hash") + (" password_reset" if temp else ""))
     return jsonify(user=_member(db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone(), db),
@@ -508,7 +511,7 @@ def force_expire(dep_id):
         return jsonify(ok=True, action="cancelled")
     if dep["status"] != "ready":
         return jsonify(error="Only a live deployment can be expired."), 409
-    engine.expire_deployment(db, current_app.config, {"deployment_id": dep_id}, lambda *a, **k: True)
+    engine.expire_deployment(db, current_app.config, {"deployment_id": dep_id, "force": True}, lambda *a, **k: True)
     audit("deploy.expired", actor_id=current_user()["id"], target=f"#{dep['number']}",
           detail="expired by administrator", project_id=dep["project_id"])
     fresh = db.execute("SELECT status, teardown_note FROM deployments WHERE id = ?", (dep_id,)).fetchone()

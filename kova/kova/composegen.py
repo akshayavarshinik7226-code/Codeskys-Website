@@ -357,6 +357,14 @@ def render(doc: dict) -> str:
 _COOLIFY_MAGIC = ("SERVICE_", "COOLIFY_")
 # The gateway as seen from an app: a container name on its own network, plain HTTP.
 _RUNTIME_URL = re.compile(r"^http://[a-z0-9-]{1,63}(?::[0-9]{1,5})?$")
+# An uploaded project's source, served to the build server by the website (uploads.build_source).
+UPLOAD_CONTEXT = re.compile(r"^https?://[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?/internal/build-source/"
+                            r"[0-9]{1,12}/[A-Za-z0-9_-]{43}(?:-[1-9][0-9]?)?\.tar\.gz$")
+
+
+def _allowed_context(context) -> bool:
+    return isinstance(context, str) and (
+        (context.startswith("https://github.com/") and "#" in context) or bool(UPLOAD_CONTEXT.match(context)))
 _PLATFORM_ENV = ("PORT", "CODESKYS_RUNTIME_URL", "CODESKYS_RUNTIME_TOKEN")
 _SERVICE_APP_KEYS = {"build", "environment", "expose", "mem_limit", "cpus", "labels", "cap_drop",
                      "security_opt", "pids_limit", "restart", "init", "logging"}
@@ -375,8 +383,8 @@ def generate_service(*, slug: str, deployment: int, app_context: str, port: int 
     slug = _check(_SLUG, slug, "project slug")
     if not isinstance(deployment, int) or deployment < 1:
         raise ComposeError("invalid deployment number")
-    if not (app_context.startswith("https://github.com/") and "#" in app_context):
-        raise ComposeError("the build context must be a pinned GitHub repository")
+    if not _allowed_context(app_context):
+        raise ComposeError("the build context must be a pinned GitHub repository or an uploaded project")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise ComposeError("invalid app port")
     if not re.match(r"^[A-Za-z0-9._/-]{1,120}$", dockerfile) or ".." in dockerfile:
@@ -408,7 +416,11 @@ def generate_service(*, slug: str, deployment: int, app_context: str, port: int 
 
 def assert_safe_service(doc: dict) -> dict:
     """Refuse any compose document that is not exactly the shape generate_service() writes:
-    no networks, volumes, ports, privileges, host namespaces or build options."""
+    no networks, volumes, ports, privileges, host namespaces or build options.
+    A multi-service document (generate_multi) is checked by :func:`assert_safe_multi`."""
+    if _is_multi(doc):
+        return assert_safe_multi(doc)
+
     def need(cond, what):
         if not cond:
             raise ComposeError(f"unsafe compose file: {what}")
@@ -423,8 +435,9 @@ def assert_safe_service(doc: dict) -> dict:
     build = app.get("build")
     need(isinstance(build, dict) and set(build) in (_BUILD_KEYS, _INLINE_BUILD_KEYS),
          "the app build may only set context and dockerfile (or a Codeskys-generated dockerfile_inline)")
-    need(isinstance(build.get("context"), str) and build["context"].startswith("https://github.com/"),
-         "the build context must be a GitHub repository")
+    need(isinstance(build.get("context"), str) and (build["context"].startswith("https://github.com/")
+                                                    or UPLOAD_CONTEXT.match(build["context"])),
+         "the build context must be a GitHub repository or an uploaded project")
     if "dockerfile_inline" in build:
         problem = _inline_problem(build["dockerfile_inline"])
         need(not problem, f"inline Dockerfile: {problem}")
@@ -442,11 +455,214 @@ def assert_safe_service(doc: dict) -> dict:
     return doc
 
 
-def for_service(project, dep, *, env_keys=(), runtime_url: str = "") -> dict:
-    """Engine wrapper: project/deployment rows -> the Coolify service compose document."""
+# ---------------------------------------------------------------- multi-service (multiservice.plan)
+
+_MULTI_KEYS = {"build", "image", "environment", "expose", "mem_limit", "cpus", "labels", "cap_drop", "cap_add",
+               "security_opt", "pids_limit", "restart", "init", "logging", "command", "entrypoint", "depends_on",
+               "healthcheck", "volumes", "working_dir", "user"}
+_MULTI_BUILD_KEYS = {"context", "dockerfile", "args", "target"}
+_HEALTH_KEYS = {"test", "interval", "timeout", "retries", "start_period", "start_interval", "disable"}
+_SVC_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+_VOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_REL_PATH = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+_ABS_PATH = re.compile(r"^/[A-Za-z0-9._/@-]{0,250}$")
+_TAG_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}(?::[A-Za-z0-9_.-]{1,32})?$")
+_INTERP_OK = re.compile(r"\$\$|\$\{[A-Za-z_][A-Za-z0-9_]{0,127}(?::?[-?][^}$]{0,200})?\}")
+_LOGGING = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
+_HARDENING = {"cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"], "pids_limit": 256,
+              "restart": "unless-stopped", "init": True}
+
+
+def _is_multi(doc) -> bool:
+    if not isinstance(doc, dict) or not isinstance(doc.get("services"), dict):
+        return False
+    services = doc["services"]
+    return set(services) != {"app"} or "volumes" in doc or not (
+        isinstance(services.get("app"), dict) and set(services["app"]) <= _SERVICE_APP_KEYS)
+
+
+def _interp_safe(text: str) -> bool:
+    """Every $ is $$ (literal) or ${NAME}/${NAME:-default} with a non-platform NAME."""
+    if "$" in _INTERP_OK.sub("", text):
+        return False
+    return not any(m.group(0)[2:].upper().startswith(("SERVICE_", "COOLIFY_", "CODESKYS_"))
+                   for m in _INTERP_OK.finditer(text) if m.group(0) != "$$")
+
+
+def generate_multi(*, slug: str, deployment: int, plan: dict, contexts: dict, env_keys=(), memory: str = "512M",
+                   cpus: str = "0.5", runtime_url: str = "") -> dict:
+    """The compose document for a multi-service project (multiservice.plan output). ``contexts``
+    maps each built service to its build context (pinned GitHub or the upload build-source)."""
+    from .multiservice import DATA_CAPS
+    slug = _check(_SLUG, slug, "project slug")
+    if not isinstance(deployment, int) or deployment < 1:
+        raise ComposeError("invalid deployment number")
+    for value, regex, what in ((memory, _MEMORY, "memory limit"), (cpus, _CPUS, "CPU limit")):
+        _check(regex, value, what)
+    shared = {}
+    for k in env_keys:
+        k = _check(_ENV_KEY, k, "environment variable name")
+        if not coolify_reserved(k):
+            shared[k] = "${" + k + "}"
+    port = int(plan["port"])
+    services = {}
+    for s in plan["services"]:
+        name = s["name"]
+        svc = {}
+        if s["kind"] == "build":
+            build = {"context": contexts[name], "dockerfile": s["dockerfile"]}
+            if s.get("args"):
+                build["args"] = dict(s["args"])
+            if s.get("target"):
+                build["target"] = s["target"]
+            svc["build"] = build
+            env = {**shared, **s["environment"]}
+        else:
+            svc["image"] = s["image"]
+            svc["cap_add"] = list(DATA_CAPS)
+            env = dict(s["environment"])
+        if name == "app":
+            env["PORT"] = str(port)
+            if runtime_url:
+                env["CODESKYS_RUNTIME_URL"] = _check(_RUNTIME_URL, runtime_url, "runtime gateway URL")
+                env["CODESKYS_RUNTIME_TOKEN"] = "${CODESKYS_RUNTIME_TOKEN}"
+            svc["expose"] = [str(port)]
+        svc["environment"] = env
+        for key in ("command", "entrypoint", "healthcheck", "working_dir", "user"):
+            if s.get(key) is not None:
+                svc[key] = s[key]
+        if s.get("depends_on"):
+            svc["depends_on"] = {d: {"condition": c} for d, c in s["depends_on"].items()}
+        if s.get("volumes"):
+            svc["volumes"] = [{"type": "volume", "source": v, "target": t} for v, t in s["volumes"]]
+        mem, cpu = (memory, cpus) if s.get("limits") is None else (f"{s['limits'][0]}M", str(s["limits"][1]))
+        role = "app" if name == "app" else ("data" if s["kind"] == "data" else "worker")
+        svc.update({"mem_limit": mem, "cpus": float(cpu),
+                    "labels": {"codeskys.deployment": str(deployment), "codeskys.role": role, "codeskys.project": slug},
+                    **_HARDENING, "logging": _LOGGING})
+        services[name] = svc
+    doc = {"services": services}
+    if plan.get("volumes"):
+        doc["volumes"] = {v: {} for v in plan["volumes"]}
+    return assert_safe_multi(doc)
+
+
+def assert_safe_multi(doc: dict) -> dict:
+    """Refuse a multi-service document that generate_multi() could not have written."""
+    from .multiservice import (DATA_CAPS, DATA_IMAGES, DEPENDS_CONDITIONS, MAX_SERVICES, MAX_VOLUMES, VULNERABLE,
+                               image_repository)
+
+    def need(cond, what):
+        if not cond:
+            raise ComposeError(f"unsafe compose file: {what}")
+
+    def strings(value, what):
+        need(isinstance(value, str) and len(value) <= 4096 and _interp_safe(value), what)
+
+    need(isinstance(doc, dict) and set(doc) <= {"services", "volumes"}, "unexpected top-level keys")
+    services, volumes = doc.get("services"), doc.get("volumes", {})
+    need(isinstance(services, dict) and 1 <= len(services) <= MAX_SERVICES and "app" in services, "services")
+    need(isinstance(volumes, dict) and len(volumes) <= MAX_VOLUMES
+         and all(isinstance(k, str) and _VOL_NAME.match(k) and v == {} for k, v in volumes.items()), "volumes")
+    total = 0
+    for name, svc in services.items():
+        need(isinstance(name, str) and _SVC_NAME.match(name), "service name")
+        need(isinstance(svc, dict) and set(svc) <= _MULTI_KEYS, f"unexpected keys on service {name}")
+        for key, value in _HARDENING.items():
+            need(svc.get(key) == value, f"{name} must keep the platform hardening ({key})")
+        need(svc.get("logging") == _LOGGING, f"{name} logging")
+        need(("build" in svc) != ("image" in svc), f"{name} must have exactly one of build and image")
+        if "build" in svc:
+            build = svc["build"]
+            need(isinstance(build, dict) and {"context", "dockerfile"} <= set(build) <= _MULTI_BUILD_KEYS,
+                 f"{name} build keys")
+            need(_allowed_context(build["context"]), f"{name} build context")
+            need(isinstance(build["dockerfile"], str) and _REL_PATH.match(build["dockerfile"])
+                 and ".." not in build["dockerfile"].split("/"), f"{name} Dockerfile path")
+            args = build.get("args", {})
+            need(isinstance(args, dict) and len(args) <= 50
+                 and all(isinstance(k, str) and _ENV_KEY.match(k) for k in args), f"{name} build args")
+            for v in args.values():
+                strings(v, f"{name} build arg value")
+            need("target" not in build or (isinstance(build["target"], str) and _TAG_RE.match(build["target"])),
+                 f"{name} build target")
+            need("cap_add" not in svc, f"{name} may not add capabilities")
+        else:
+            image = svc["image"]
+            need(isinstance(image, str) and not VULNERABLE.search(image), f"{name} image")
+            repo, tag = image_repository(image)
+            need(repo in DATA_IMAGES and bool(_TAG_RE.match(tag or "")) and image == f"{repo}:{tag}", f"{name} image")
+            need(name != "app", "the public service must be built from the project")
+            need(svc.get("cap_add") == list(DATA_CAPS), f"{name} capabilities")
+        env = svc.get("environment", {})
+        need(isinstance(env, dict) and all(isinstance(k, str) and _ENV_KEY.match(k) for k in env),
+             f"{name} environment")
+        for k, v in env.items():
+            strings(v, f"{name} environment value")
+            platform = k in ("CODESKYS_RUNTIME_URL", "CODESKYS_RUNTIME_TOKEN")
+            need(not k.upper().startswith(("SERVICE_", "COOLIFY_"))
+                 and (not k.upper().startswith("CODESKYS_") or (name == "app" and platform)),
+                 f"{name} reserved environment variable {k}")
+        if name == "app":
+            need(isinstance(svc.get("expose"), list) and len(svc["expose"]) == 1 and str(svc["expose"][0]).isdigit()
+                 and env.get("PORT") == str(svc["expose"][0]), "the app exposes exactly one port")
+            need(("CODESKYS_RUNTIME_TOKEN" in env) == ("CODESKYS_RUNTIME_URL" in env)
+                 and env.get("CODESKYS_RUNTIME_TOKEN", "${CODESKYS_RUNTIME_TOKEN}") == "${CODESKYS_RUNTIME_TOKEN}"
+                 and ("CODESKYS_RUNTIME_URL" not in env or bool(_RUNTIME_URL.match(env["CODESKYS_RUNTIME_URL"]))),
+                 "runtime gateway settings")
+        else:
+            need("expose" not in svc, f"only the app service is exposed ({name})")
+        for key in ("command", "entrypoint"):
+            if key in svc:
+                v = svc[key]
+                need(isinstance(v, str) or (isinstance(v, list) and len(v) <= 100), f"{name} {key}")
+                for w in ([v] if isinstance(v, str) else v):
+                    strings(w, f"{name} {key}")
+        if "healthcheck" in svc:
+            h = svc["healthcheck"]
+            need(isinstance(h, dict) and set(h) <= _HEALTH_KEYS, f"{name} healthcheck")
+            for w in h.get("test", []):
+                strings(w, f"{name} healthcheck test")
+        if "depends_on" in svc:
+            deps = svc["depends_on"]
+            need(isinstance(deps, dict) and all(
+                d in services and d != name and isinstance(c, dict) and set(c) == {"condition"}
+                and c["condition"] in DEPENDS_CONDITIONS for d, c in deps.items()), f"{name} depends_on")
+        for vol in svc.get("volumes", []):
+            need(isinstance(vol, dict) and set(vol) == {"type", "source", "target"} and vol["type"] == "volume"
+                 and vol["source"] in volumes and isinstance(vol["target"], str) and _ABS_PATH.match(vol["target"]),
+                 f"{name} volumes (named volumes only)")
+        need("working_dir" not in svc or (isinstance(svc["working_dir"], str)
+                                          and _ABS_PATH.match(svc["working_dir"])), f"{name} working_dir")
+        need("user" not in svc or (isinstance(svc["user"], str) and _USER_RE.match(svc["user"])), f"{name} user")
+        need(isinstance(svc.get("mem_limit"), str) and _MEMORY.match(svc["mem_limit"]), f"{name} memory limit")
+        need(isinstance(svc.get("cpus"), float) and 0 < svc["cpus"] <= 2, f"{name} CPU limit")
+        labels = svc.get("labels")
+        need(isinstance(labels, dict) and set(labels) == {"codeskys.deployment", "codeskys.role", "codeskys.project"},
+             f"{name} labels")
+        total += _megabytes(svc["mem_limit"])
+    need(total <= 4096, "total memory")
+    return doc
+
+
+def _megabytes(value: str) -> int:
+    n, unit = int(value[:-1]), value[-1].lower()
+    return n * 1024 if unit == "g" else n if unit == "m" else max(1, n // 1024)
+
+
+def build_contexts(doc: dict) -> list:
+    """Every build context in a (single or multi-service) Codeskys compose document."""
+    return [svc["build"]["context"] for svc in (doc.get("services") or {}).values()
+            if isinstance(svc, dict) and isinstance(svc.get("build"), dict)]
+
+
+def for_service(project, dep, *, env_keys=(), runtime_url: str = "", app_context: str = "") -> dict:
+    """Engine wrapper: project/deployment rows -> the Coolify service compose document.
+    ``app_context`` replaces the GitHub context (an uploaded project's build-source URL)."""
     from . import dockerfiles
     fw = FRAMEWORKS.get(project["framework"], FRAMEWORKS["static"])
-    context = build_context(project["repo_url"], dep["commit_sha"], project["root_dir"] or "")
+    context = app_context or build_context(project["repo_url"], dep["commit_sha"], project["root_dir"] or "")
     port = int(project["port"] or fw.get("port") or 3000)
     inline = None
     if project["framework"] != "docker":

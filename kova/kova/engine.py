@@ -277,6 +277,34 @@ def _ms_since(iso):
     return int((datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds() * 1000)
 
 
+HOSTING_GRACE = timedelta(hours=24)       # after paid hosting ends, before the app is expired
+
+
+def hosting_expiry(conn, user_id) -> str | None:
+    """When a paid-hosting account's deployments expire (end of the paid period + grace), or None
+    when the account has no paid hosting that still counts."""
+    row = conn.execute("SELECT hosting_until FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None or not row["hosting_until"]:
+        return None
+    until = datetime.fromisoformat(row["hosting_until"]) + HOSTING_GRACE
+    return until.isoformat(timespec="seconds") if until > datetime.now(timezone.utc) else None
+
+
+def extend_for_hosting(conn, user_id) -> int:
+    """After a paid-hosting payment: the account's live deployments stay up until the new end (+ grace).
+    Only the expiry time changes (no rebuild, same URL, same data). A deployment the expiry worker has
+    already claimed (stage 'expiring') is not touched: it is being removed and cannot be saved.
+    Returns how many deployments were extended."""
+    until = hosting_expiry(conn, user_id)
+    if not until:
+        return 0
+    cur = conn.execute(
+        "UPDATE deployments SET expires_at = ? WHERE status = 'ready' AND expired_at IS NULL AND stage != 'expiring' "
+        "AND (expires_at IS NULL OR expires_at < ?) AND project_id IN (SELECT id FROM projects WHERE owner_id = ?)",
+        (until, until, user_id))
+    return cur.rowcount
+
+
 def _finish(conn, dep, project, status, url=None, error=None):
     started = dep["started_at"] or dep["created_at"]
     fields = {"status": status, "stage": status, "finished_at": utcnow(), "duration_ms": _ms_since(started)}
@@ -285,16 +313,14 @@ def _finish(conn, dep, project, status, url=None, error=None):
     if error:
         fields["error"] = error[:500]
     if status == "ready":
-        ttl = project["ttl_hours"] or 24
-        fields["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=ttl)).isoformat(timespec="seconds")
-        # Free (hobby) projects get ONE window: updating inside it must not extend it.
-        owner = conn.execute("SELECT plan FROM users WHERE id = ?", (project["owner_id"],)).fetchone()
-        if owner is not None and owner["plan"] == "hobby" and project["current_deployment_id"]:
-            live = conn.execute("SELECT expires_at FROM deployments WHERE id = ? AND status = 'ready' "
-                                "AND expires_at IS NOT NULL AND expires_at > ?",
-                                (project["current_deployment_id"], utcnow())).fetchone()
-            if live is not None:
-                fields["expires_at"] = live["expires_at"]
+        # ONE clock per project (see plans.py): a free project's first successful deployment
+        # starts its single window and every later deployment inherits the same expiry; paid
+        # hosting lasts as long as it was paid for (+ the 24 h grace); an administrator's
+        # deployments have no end date. None means "no end date".
+        from . import plans
+        expires = plans.expiry_for_new_deployment(conn, project)
+        if expires:
+            fields["expires_at"] = expires
     _set(conn, dep["id"], **fields)
     if status == "ready" and dep["target"] == "production":
         conn.execute("UPDATE projects SET current_deployment_id = ?, updated_at = ? WHERE id = ?",
@@ -533,6 +559,11 @@ def run_deployment(conn, app_config, payload, beat):
         if final["provider"] == STATIC:
             from . import uploads
             uploads.discard_deployment(conn, app_config, final)
+    if (final is not None and final["provider"] == COOLIFY and final["trigger"] == "upload"
+            and final["status"] not in ("queued", "building")):
+        # The image is built (or never will be): the uploaded source is no longer needed.
+        from . import uploads
+        uploads.remove_deployment_files(app_config, final)
 
 
 @handler("expire")
@@ -551,6 +582,24 @@ def expire_deployment(conn, app_config, payload, beat):
     project = conn.execute("SELECT * FROM projects WHERE id = ?", (dep["project_id"],)).fetchone()
     if project is None:
         return
+    # Paid hosting bought since the sweep queued this: extend instead of expiring.
+    force = bool(payload.get("force"))             # an administrator's "expire now"
+    if not force and dep["stage"] != "expiring" and dep["status"] == "ready":
+        extend_for_hosting(conn, project["owner_id"])
+        conn.commit()
+    # Claim: one conditional UPDATE that also checks paid hosting, so a payment and the expiry can never
+    # both win. A payment committed first makes the claim match nothing; once the claim is committed,
+    # extend_for_hosting leaves this deployment alone (it is being removed).
+    grace_start = (datetime.now(timezone.utc) - HOSTING_GRACE).isoformat(timespec="seconds")
+    claimed = conn.execute(
+        "UPDATE deployments SET stage = 'expiring' WHERE id = ? AND expired_at IS NULL AND (stage = 'expiring' OR "
+        "(status = 'ready' AND (? OR NOT EXISTS (SELECT 1 FROM users u JOIN projects p ON p.owner_id = u.id "
+        "WHERE p.id = deployments.project_id AND u.hosting_until IS NOT NULL AND u.hosting_until > ?))))",
+        (dep_id, 1 if force else 0, grace_start)).rowcount
+    conn.commit()
+    if not claimed:
+        return                                  # not due any more (paid hosting) or already handled
+    dep = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
     note = "Deployment expired."
     is_live = project["current_deployment_id"] == dep["id"]
     # Credential first: even if removing the app fails below, it can no longer
@@ -583,7 +632,8 @@ def expire_deployment(conn, app_config, payload, beat):
                  (utcnow(), "deploy.expired", f"#{dep['number']}", note[:200], project["id"]))
     conn.commit()
     _notify(conn, project["owner_id"], "deploy.expired", f"{project['name']} has expired",
-            f"Deploy #{dep['number']} reached its {project['ttl_hours']}-hour limit. Redeploy to bring it back.",
+            "Your free 24 hours have ended, so the link now shows a 404 page. "
+            "Upgrade your plan to bring this project back online.",
             f"#/projects/{project['slug']}")
 
 
@@ -602,6 +652,7 @@ def teardown_coolify_app(conn, app_config, project) -> str:
     except CoolifyError as exc:
         if "404" in str(exc):
             conn.execute("UPDATE projects SET provider_ref = NULL WHERE id = ?", (project["id"],))
+            conn.execute("DELETE FROM managed_credentials WHERE project_id = ?", (project["id"],))
             conn.commit()
             return "The application was already gone."
         return f"Expired, but the application could not be inspected: {exc}"
@@ -617,6 +668,8 @@ def teardown_coolify_app(conn, app_config, project) -> str:
     except CoolifyError as exc:
         return f"Expired and stopped, but deleting the application failed: {exc}"
     conn.execute("UPDATE projects SET provider_ref = NULL, coolify_app_name = '' WHERE id = ?", (project["id"],))
+    # Its databases and their volumes are gone: the next deployment starts them with new settings.
+    conn.execute("DELETE FROM managed_credentials WHERE project_id = ?", (project["id"],))
     conn.commit()
     return f"Expired. Application {uuid} was stopped and deleted."
 
@@ -796,9 +849,8 @@ def _run_simulator(conn, app_config, dep, project, beat):
     _log(conn, dep_id, f"Would publish output from \"{out}\" with "
                        f"{project['limits_memory']} memory / {project['limits_cpus']} CPU limits", stage="deploying")
     pause(0.4, 0.9)
-    ttl = project["ttl_hours"] or 24
     url = f"/sites/{project['slug']}/" if dep["target"] == "production" else f"/sites/{project['slug']}/?deploy={dep['id']}"
-    _log(conn, dep_id, f"Simulated deployment ready → {url} (expires in {ttl}h)", "success", "ready")
+    _log(conn, dep_id, f"Simulated deployment ready → {url}", "success", "ready")
     _finish(conn, dep, project, "ready", url=url)
 
 
@@ -853,11 +905,14 @@ def _run_static(conn, app_config, dep, project, beat):
     zip_path.unlink(missing_ok=True)
     url = uploads.site_url(app_config, project["slug"])
     check()
-    ttl = project["ttl_hours"] or 24
-    log(f"Live at {url} (expires in {ttl}h on the free plan)", "success", "ready")
+    log(f"Live at {url}", "success", "ready")
     fresh = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
     _finish(conn, fresh, project, "ready", url=url)
     uploads.cleanup_superseded(conn, app_config, project, keep_dep_id=dep_id)
+    if project["provider_ref"] and project["provider"] == COOLIFY:
+        # An earlier upload of this project ran as an app: the static site replaces it.
+        note = teardown_coolify_app(conn, app_config, project).replace("Expired. ", "", 1)
+        log(f"The previous app version was removed: {note}", "info", "ready")
 
 
 # ---------------------------------------------------------------- coolify
@@ -966,17 +1021,38 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
     import base64
     from . import composegen
     dep_id = dep["id"]
-    if project["framework"] == "docker":
+    # An uploaded project: the same checks, read from the uploaded files instead of GitHub.
+    source = _stage_upload(conn, app_config, dep, project) if _col(project, "source_type", "") == "upload" else None
+    _refuse_vulnerable_lab(app_config, dep, project, source)
+    if source is None:
+        project = _autodetect(conn, app_config, dep, project)
+    plan = contexts = None
+    if project["framework"] == "compose":
+        plan, contexts = _compose_plan(conn, app_config, dep, project, source)
+    elif project["framework"] == "docker" and source is not None:
+        from . import uploads
+        text = uploads.read_source_file(app_config, project, dep, "Dockerfile")
+        if text is None:
+            raise CoolifyError("The uploaded project has no Dockerfile at its top level. Add one, or choose "
+                               "a framework in Project → Settings, then upload again.")
+        problems = buildpolicy.dockerfile_problems(text)
+        if problems:
+            raise CoolifyError("This Dockerfile cannot be built on Codeskys: " + "; ".join(problems) + ".")
+        _log(conn, dep_id, "Dockerfile checked: no host networking, insecure mode or devices requested.",
+             stage="provisioning")
+        project = _adopt_exposed_port(conn, dep_id, project, text)
+    elif project["framework"] == "docker":
         # The repository's own Dockerfile (framework projects get one generated by Codeskys,
         # which composegen.assert_safe_service checks line by line).
         root = (project["root_dir"] or "").strip("/")
         try:
-            buildpolicy.check_dockerfile(project["repo_url"], dep["commit_sha"],
-                                         f"{root}/Dockerfile" if root else "Dockerfile")
+            text = buildpolicy.check_dockerfile(project["repo_url"], dep["commit_sha"],
+                                                f"{root}/Dockerfile" if root else "Dockerfile")
         except buildpolicy.PolicyError as exc:
             raise CoolifyError(str(exc)) from None
         _log(conn, dep_id, "Dockerfile checked: no host networking, insecure mode or devices requested.",
              stage="provisioning")
+        project = _adopt_exposed_port(conn, dep_id, project, text)
     else:
         from . import dockerfiles
         try:
@@ -985,15 +1061,51 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
             raise CoolifyError(str(exc)) from None
         # The preset's commands must fit the repository at this commit (a missing app.py would
         # otherwise only show up as a crash after a full build).
-        if app_config.get("GIT_LOOKUPS", True):
+        files = None
+        if source is not None:
+            from . import uploads
+            project = _adapt_entry(conn, dep_id, project, source["files"],
+                                   lambda p: uploads.read_source_file(app_config, project, dep, p))
+            build = dockerfiles.settings(project)
+            # Paths are relative to the build context (the root directory is already applied).
+            problem = buildpolicy.entrypoint_problem(
+                {"root_dir": ""}, build | {"label": FRAMEWORKS[project["framework"]]["name"]}, source["files"])
+            if problem:
+                raise CoolifyError(problem.replace("This repository", "The uploaded project", 1)
+                                   .replace("the top level of the repository", "the top level of the upload"))
+        elif app_config.get("GIT_LOOKUPS", True):
             files = buildpolicy.repository_files(project["repo_url"], dep["commit_sha"])
+            root = (project["root_dir"] or "").strip("/")
+            if files is not None:
+                project = _adapt_entry(
+                    conn, dep_id, project,
+                    {f[len(root) + 1:] if root else f for f in files if not root or f.startswith(root + "/")},
+                    lambda p: buildpolicy.fetch_file(project["repo_url"], dep["commit_sha"], f"{root}/{p}" if root else p))
+                build = dockerfiles.settings(project)
             problem = buildpolicy.entrypoint_problem(
                 project, build | {"label": FRAMEWORKS[project["framework"]]["name"]}, files)
             if problem:
+                from . import projectscan
+                root = (project["root_dir"] or "").strip("/")
+                rel = {f[len(root) + 1:] if root else f for f in files if not root or f.startswith(root + "/")}
+                if FRAMEWORKS[project["framework"]]["static"] and projectscan.choose(rel, lambda _p: None) is None:
+                    problem = projectscan.refusal(rel)      # nothing runnable at all: say so plainly
                 raise CoolifyError(problem)
+            if files is None and build["static"] and not build["install"] and not build["build"]:
+                # The file list needs the GitHub API (hourly limit); the home page is one raw read.
+                out = (build.get("output") or "").strip("/")
+                page = "/".join(p for p in (root, out, "index.html") if p)
+                try:
+                    missing = buildpolicy.fetch_file(project["repo_url"], dep["commit_sha"], page) is None
+                except buildpolicy.PolicyError:
+                    missing = False
+                if missing:
+                    raise CoolifyError(f"This repository has no {page}, so there is no home page to show. If it is "
+                                       "an app (Python, Node, ...), choose its framework in Project → Settings.")
             if files is None:
                 _log(conn, dep_id, "Could not list the repository files to check the start command; "
                                    "building anyway.", "warn", "provisioning")
+        _warn_machine_paths(conn, app_config, dep, project, source, files)
         _log(conn, dep_id, f"Building with the Codeskys {FRAMEWORKS[project['framework']]['name']} "
                            "Dockerfile (isolated build, unprivileged container).", stage="provisioning")
     # A credential only when the shared runtime gateway holds it: the app never does.
@@ -1006,8 +1118,15 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
         "SELECT key FROM env_vars WHERE project_id = ? AND (',' || targets || ',') LIKE ?",
         (project["id"], f"%,{dep['target']},%"))]
     try:
-        doc = composegen.for_service(project, dep, env_keys=keys,
-                                     runtime_url=app_config["RUNTIME_GATEWAY_URL"] if dep_ref else "")
+        if plan is not None:
+            doc = composegen.generate_multi(
+                slug=project["slug"], deployment=int(dep["id"]), plan=plan, contexts=contexts, env_keys=keys,
+                memory=project["limits_memory"] or "512M", cpus=project["limits_cpus"] or "0.5",
+                runtime_url=app_config["RUNTIME_GATEWAY_URL"] if dep_ref else "")
+        else:
+            doc = composegen.for_service(project, dep, env_keys=keys,
+                                         runtime_url=app_config["RUNTIME_GATEWAY_URL"] if dep_ref else "",
+                                         app_context=source["url"] if source else "")
     except composegen.ComposeError as exc:
         raise CoolifyError(f"Could not prepare the deployment: {exc}.") from None
     skipped = sorted({k for k in keys if composegen.coolify_reserved(k)})
@@ -1046,6 +1165,8 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
             v = box.decrypt(e["value_cipher"]) if e["is_secret"] and e["value_cipher"] else (e["value"] or "")
             # Literal: Coolify must not expand ${...} in a student's value.
             values.append({"key": e["key"], "value": v, "is_literal": True})
+        # Generated database settings; a student's own variable of the same name always wins.
+        values += managed_values(conn, app_config, project, skip={v["key"] for v in values})
         digest = ""
         if dep_ref:
             token, digest = runtime_secrets.new_workload_token()
@@ -1078,6 +1199,260 @@ def _run_coolify_compose(conn, app_config, api, s, dep, project, domain, beat, p
                        "deployment; the app's own output is shown if it fails to start.", stage="building")
     return _poll_coolify(conn, api, dep, project, app_uuid, public_url or domain, beat, s,
                          previous_running=was_running)
+
+
+def _compose_plan(conn, app_config, dep, project, source):
+    """(plan, {service: build context}) for a Docker Compose project, after every check that
+    needs no Coolify call: the compose rules (multiservice) and each service's Dockerfile."""
+    from . import composegen, multiservice, uploads
+    dep_id, root = dep["id"], (project["root_dir"] or "").strip("/")
+    under = (lambda p: f"{root}/{p}" if root else p)
+    try:
+        if source is not None:
+            files = source["files"]
+            read = (lambda p: uploads.read_source_file(app_config, project, dep, p))
+        else:
+            files = buildpolicy.repository_files(project["repo_url"], dep["commit_sha"]) \
+                if app_config.get("GIT_LOOKUPS", True) else None
+            if files is not None:
+                files = {f[len(root) + 1:] if root else f for f in files if not root or f.startswith(root + "/")}
+            read = (lambda p: buildpolicy.fetch_file(project["repo_url"], dep["commit_sha"], under(p)))
+        name = multiservice.find_compose({f for f in files if "/" not in f}) if files is not None else None
+        text = None
+        for candidate in ([name] if name else [] if files is not None else multiservice.COMPOSE_NAMES):
+            text = read(candidate)
+            if text:
+                break
+        if not text:
+            raise CoolifyError("This project is set to Docker Compose, but there is no docker-compose.yml (or "
+                               "compose.yaml) at its top level. Add one, or choose another framework in Project → "
+                               "Settings.")
+        plan = multiservice.plan(multiservice.parse(text), files)
+        for s in plan["services"]:
+            if s["kind"] != "build":
+                continue
+            dockerfile = read(s["path"])
+            if dockerfile is None:
+                raise CoolifyError(f"The service {s['name']} is built from {s['path']}, which is not in the project.")
+            problems = buildpolicy.dockerfile_problems(dockerfile)
+            if problems:
+                raise CoolifyError(f"The Dockerfile of {s['name']} ({s['path']}) cannot be built on Codeskys: "
+                                   + "; ".join(problems) + ".")
+    except multiservice.ComposePlanError as exc:
+        raise CoolifyError(str(exc)) from None
+    except buildpolicy.PolicyError as exc:
+        raise CoolifyError(str(exc)) from None
+    have = {r["key"] for r in conn.execute(
+        "SELECT key FROM env_vars WHERE project_id = ? AND (',' || targets || ',') LIKE ?",
+        (project["id"], f"%,{dep['target']},%"))}
+    # The databases Codeskys runs for this project get their names, users and passwords from Codeskys
+    # unless the student set them; values the student set are never replaced.
+    needed = {k: role for k, role in plan["db_credentials"].items() if k not in have}
+    if needed:
+        made = _managed_credentials(conn, app_config, project, needed)
+        _log(conn, dep_id, "Codeskys prepared private database settings for this deployment: " + ", ".join(sorted(needed))
+             + (f" ({made} new)" if made else " (kept from the running database)")
+             + ". They are not shown anywhere; set your own in Project → Settings → Environment variables to replace "
+               "them on the next fresh start.", stage="provisioning")
+    missing = [k for k in plan["required_db_env"] if k not in have and k not in plan["db_credentials"]]
+    if missing:
+        # A database setting Codeskys cannot safely choose (not a name, user or password): ask the student.
+        raise CoolifyError(
+            "The database settings in the docker-compose file use these environment variables without a default: "
+            + ", ".join(missing[:20]) + ". Codeskys cannot choose them safely; add them in Project → Settings → "
+              "Environment variables, then deploy again.")
+    unset = [k for k in plan["required_env"] if k not in have and k not in plan["db_credentials"]]
+    if unset:
+        _log(conn, dep_id, "Note: the docker-compose file uses " + ", ".join(unset[:20]) + " without a default and the "
+                           "project does not set them, so they are empty (as with docker compose). Set them in "
+                           "Project → Settings → Environment variables if the app needs them.", "warn", "provisioning")
+    contexts, staged = {}, {}
+    for s in plan["services"]:
+        if s["kind"] != "build":
+            continue
+        if source is None:
+            contexts[s["name"]] = composegen.build_context(project["repo_url"], dep["commit_sha"], under(s["context"]))
+        elif not s["context"]:
+            contexts[s["name"]] = source["url"]
+        else:
+            if s["context"] not in staged:
+                try:
+                    staged[s["context"]] = uploads.stage_subcontext(app_config, project, dep, s["context"],
+                                                                    len(staged) + 1)
+                except uploads.UploadError as exc:
+                    raise CoolifyError(str(exc)) from None
+            contexts[s["name"]] = staged[s["context"]]
+    parts = []
+    for s in plan["services"]:
+        what = s["image"] if s["kind"] == "data" else f"built from {s['path']}"
+        public = f", public on port {plan['port']}" if s["name"] == "app" else ""
+        parts.append(f"{s['name']} ({what}{public})")
+    _log(conn, dep_id, f"Docker Compose project with {len(parts)} services: " + "; ".join(parts) + ".",
+         stage="provisioning")
+    for note in plan["warnings"][:10]:
+        _log(conn, dep_id, f"Note: {note}.", "warn", "provisioning")
+    _log(conn, dep_id, "Every Dockerfile checked: no host networking, insecure mode or devices requested.",
+         stage="provisioning")
+    return plan, contexts
+
+
+def _adapt_entry(conn, dep_id, project, files, read):
+    """A preset project with no start command of its own runs the file that really holds the app
+    (streamlit_app.py, main.py, ...). The command is saved, so Project → Settings shows it and the
+    student can change it. Returns the fresh project row."""
+    from . import projectscan
+    if (project["start_command"] or "").strip():
+        return project
+    try:
+        start = projectscan.entry_start(project["framework"], files, read)
+    except buildpolicy.PolicyError:
+        return project
+    if not start:
+        return project
+    conn.execute("UPDATE projects SET start_command = ? WHERE id = ?", (start, project["id"]))
+    conn.commit()
+    _log(conn, dep_id, f"Start command set to \"{start}\": the app is not where the preset expects it. "
+                       "Change it in Project → Settings.", stage="provisioning")
+    return conn.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
+
+
+def _adopt_exposed_port(conn, dep_id, project, dockerfile: str):
+    """A Dockerfile project still on the preset's default port listens where its Dockerfile
+    EXPOSEs (a port the student set themselves is never changed). Returns the fresh project row."""
+    default = FRAMEWORKS["docker"]["port"]
+    port = buildpolicy.exposed_port(dockerfile)
+    if port is None or port == default or (project["port"] and int(project["port"]) != default):
+        return project
+    conn.execute("UPDATE projects SET port = ? WHERE id = ?", (port, project["id"]))
+    conn.commit()
+    _log(conn, dep_id, f"The Dockerfile exposes port {port}, so the app is reached on port {port} (change it in "
+                       "Project → Settings).", stage="provisioning")
+    return conn.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
+
+
+def _autodetect(conn, app_config, dep, project):
+    """A GitHub project whose preset does not fit the repository at this commit ("Dockerfile" without a
+    Dockerfile, "Docker Compose" without a compose file, "Static HTML" without a page) is built as what
+    the repository really is, possibly from a folder. The change is saved (Project → Settings shows it)
+    and logged. A preset that fits is never changed. Returns the fresh project row."""
+    from . import multiservice, projectscan
+    fw = project["framework"]
+    if fw not in ("docker", "compose", "static", "docs") or not app_config.get("GIT_LOOKUPS", True):
+        return project
+    if fw == "static" and (project["install_command"] or project["build_command"]):
+        return project                                      # the student's own build makes the page
+    root = (project["root_dir"] or "").strip("/")
+    every = buildpolicy.repository_files(project["repo_url"], dep["commit_sha"])
+    if every is None:
+        return project                                      # unknown contents: the preset's own checks decide
+    files = {f[len(root) + 1:] if root else f for f in every if not root or f.startswith(root + "/")}
+    top = projectscan.top_level(files)
+    where = f"the {root}/ folder" if root else "the top level of the repository"
+    missing = {"docker": None if "Dockerfile" in top else f"there is no Dockerfile in {where}",
+               "compose": None if multiservice.find_compose(top) else f"there is no docker-compose file in {where}",
+               "static": None if projectscan._has_site(files) else f"there is no index.html in {where}",
+               "docs": "the repository has an app in a folder"}[fw]
+    if missing is None:
+        return project
+    try:
+        detected, sub = projectscan.detect(
+            files, lambda p: buildpolicy.fetch_file(project["repo_url"], dep["commit_sha"], f"{root}/{p}" if root else p))
+    except buildpolicy.PolicyError:
+        return project
+    if detected is None or (detected == fw and not sub) or (fw == "docs" and not sub):
+        return project                                      # a docs preview stays one unless an app is in a folder
+    new_root = "/".join(p for p in (root, sub) if p)
+    conn.execute("UPDATE projects SET framework = ?, root_dir = ?, port = ?, install_command = '', build_command = '', "
+                 "output_dir = '', start_command = '' WHERE id = ?",
+                 (detected, new_root, FRAMEWORKS[detected]["port"], project["id"]))
+    conn.commit()
+    _log(conn, dep["id"], f"The project was set to {FRAMEWORKS[fw]['name']}, but {missing}. Codeskys detected a "
+                          f"{FRAMEWORKS[detected]['name']} project" + (f" in {new_root}/" if sub else "")
+         + " and builds it that way (saved in Project → Settings; change it there if this is wrong).",
+         "warn", "provisioning")
+    return conn.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
+
+
+def _refuse_vulnerable_lab(app_config, dep, project, source):
+    """Intentionally vulnerable training apps (Juice Shop, DVWA, ...) never go on the internet,
+    whatever their Dockerfile says: their own code is the vulnerability."""
+    from . import multiservice, projectscan, uploads
+    if source is not None:
+        problem = projectscan.unsafe_reason(source["files"],
+                                            lambda p: uploads.read_source_file(app_config, project, dep, p))
+        if problem:
+            raise CoolifyError(problem)
+    else:
+        repo = urlsplit(project["repo_url"] or "").path.strip("/").removesuffix(".git")
+        if multiservice.VULNERABLE.search(repo):
+            raise CoolifyError(str(multiservice.lab_refusal(f"The repository {repo[:100]}", " is ")))
+
+
+def _warn_machine_paths(conn, app_config, dep, project, source, repo_files):
+    """A warning (never a refusal) when the code opens a file by a path on the student's computer.
+    ``repo_files`` is the repository listing the preflight already read (None: not known)."""
+    from . import projectscan, uploads
+    root = (project["root_dir"] or "").strip("/")
+    try:
+        if source is not None:
+            files, read = source["files"], (lambda p: uploads.read_source_file(app_config, project, dep, p))
+        elif repo_files is not None:
+            files = {f[len(root) + 1:] if root else f for f in repo_files if not root or f.startswith(root + "/")}
+            read = (lambda p: buildpolicy.fetch_file(project["repo_url"], dep["commit_sha"], f"{root}/{p}" if root else p))
+        else:
+            return
+        found = projectscan.machine_paths(files, read)
+    except buildpolicy.PolicyError:
+        return
+    for name, path in found[:3]:
+        _log(conn, dep["id"], f"Warning: {name} opens {path}, a path on your own computer that does not exist in "
+                              "the deployed app. Use a path relative to the project (for example "
+                              "Path(__file__).parent / \"model.pt\").", "warn", "provisioning")
+
+
+_ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_LOWER = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _managed_credentials(conn, app_config, project, needed: dict) -> int:
+    """Keep (or create) the generated value of each ``{variable: role}``; returns how many are new.
+    Letters and digits only, so they are safe in connection URLs, shells and config files."""
+    box = Secrets(app_config["ENCRYPTION_KEY"])
+    have = {r["key"] for r in conn.execute("SELECT key FROM managed_credentials WHERE project_id = ?", (project["id"],))}
+    made = 0
+    for key, role in sorted(needed.items()):
+        if key in have:
+            continue
+        value = ("".join(secrets.choice(_ALNUM) for _ in range(32)) if role == "password" else
+                 ("u" if role == "user" else "db") + "_" + "".join(secrets.choice(_LOWER) for _ in range(10)))
+        conn.execute("INSERT INTO managed_credentials (project_id, key, value_cipher, created_at) VALUES (?,?,?,?)",
+                     (project["id"], key, box.encrypt(value), utcnow()))
+        made += 1
+    conn.commit()
+    return made
+
+
+def managed_values(conn, app_config, project, skip=()) -> list:
+    """The generated database settings as deployment-engine variables (decrypted only here)."""
+    box = Secrets(app_config["ENCRYPTION_KEY"])
+    return [{"key": r["key"], "value": box.decrypt(r["value_cipher"]), "is_literal": True}
+            for r in conn.execute("SELECT key, value_cipher FROM managed_credentials WHERE project_id = ? ORDER BY key",
+                                  (project["id"],)) if r["key"] not in skip]
+
+
+def _stage_upload(conn, app_config, dep, project) -> dict:
+    """Unpack an uploaded project and pack it as the build context the build server fetches."""
+    from . import uploads
+    _set(conn, dep["id"], stage="cloning")
+    log = (lambda msg, level="info": _log(conn, dep["id"], msg, level, "cloning"))
+    try:
+        source = uploads.stage_build_source(app_config, project, dep, log)
+    except uploads.UploadError as exc:
+        raise CoolifyError(str(exc)) from None
+    log(f"Prepared {source['count']:,} uploaded files ({source['bytes'] / (1024 * 1024):.1f} MB compressed) "
+        "for an isolated build.")
+    _set(conn, dep["id"], stage="provisioning")
+    return source
 
 
 def _remove_unstarted_service(conn, api, dep_id, project):
@@ -1269,7 +1644,9 @@ def verify_app_ready(conn, api, dep, project, url, beat, settings) -> str:
             state = str(api.get_app(project["provider_ref"]).get("status") or "")
         except CoolifyError as exc:
             state, last = "", f"could not read the application status ({exc})"
-        if _app_running(state):
+        # Several containers: a finished one-off service (migrations, seeding) makes Coolify report
+        # "degraded"; the URL check below decides whether the app itself works.
+        if _app_running(state) or (project["framework"] == "compose" and state.lower().startswith("degraded")):
             ok, detail = probe_app(url, settings.get("probe_url", ""))
             if ok:
                 passes += 1

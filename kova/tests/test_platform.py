@@ -141,10 +141,13 @@ class DeploymentTests(PlatformCase):
         r = self.call("post", "/api/projects/web-app/deploy")
         second = self.wait(r.get_json()["deployment"]["id"])
         self.assertEqual(second["number"], 2)
+        # Only the LATEST deployment may be acted on; older ones are view-only history.
         r = self.call("post", f"/api/deployments/{first['id']}/promote")
-        self.assertEqual(r.get_json()["mode"], "instant")
+        self.assertEqual(r.status_code, 409)
+        r = self.call("post", f"/api/deployments/{first['id']}/redeploy")
+        self.assertEqual(r.status_code, 409)
         proj = self.client.get("/api/projects/web-app").get_json()["project"]
-        self.assertEqual(proj["production"]["id"], first["id"])
+        self.assertEqual(proj["production"]["id"], second["id"])
 
     def test_preview_does_not_replace_production(self):
         self.as_student()
@@ -220,7 +223,11 @@ class AccountAndAdminTests(PlatformCase):
     def test_password_change(self):
         self.as_student()
         self.assertEqual(self.call("post", "/api/account/password", {"current": "wrong", "new": "x" * 14}).status_code, 400)
-        self.assertEqual(self.call("post", "/api/account/password", {"current": STUDENT[2], "new": "brand-new-pass-1"}).status_code, 200)
+        # a correct current password but a weak new one is refused with a reason
+        weak = self.call("post", "/api/account/password", {"current": STUDENT[2], "new": "brand-new-pass-1"})
+        self.assertEqual(weak.status_code, 400)
+        self.assertIn("stronger", weak.get_json()["error"])
+        self.assertEqual(self.call("post", "/api/account/password", {"current": STUDENT[2], "new": "Brand-New-Pass-1!"}).status_code, 200)
 
     def test_admin_only_endpoints(self):
         self.as_student()

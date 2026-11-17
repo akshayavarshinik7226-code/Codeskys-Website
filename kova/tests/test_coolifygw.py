@@ -224,3 +224,30 @@ class GatewayHttpTests(unittest.TestCase):
         api.stop_app(UUID)
         self.assertEqual(_Upstream.seen[-1][1], f"/api/v1/services/{UUID}/stop?docker_cleanup=true")
         self.assertTrue(all(s[2] == "Bearer 1|realtoken-from-file" for s in _Upstream.seen))
+
+
+class UploadContextTests(unittest.TestCase):
+    """An uploaded project's build context must be the configured website address, nothing else."""
+    BASE = "http://172.23.0.11:8000"
+
+    def body(self, context):
+        return create_body(docker_compose_raw=b64(compose(app_context=context)))
+
+    def test_only_the_configured_build_source_address_passes(self):
+        cfg = CFG | {"build_source_url": self.BASE}
+        check("POST", "/services", {}, self.body(self.BASE + "/internal/build-source/7/" + "b" * 43 + ".tar.gz"), cfg)
+        for host in ("http://169.254.169.254", "http://172.23.0.2:8080", "http://172.23.0.11:8001"):
+            with self.assertRaises(Refused, msg=host):
+                check("POST", "/services", {}, self.body(host + "/internal/build-source/7/" + "b" * 43 + ".tar.gz"),
+                      cfg)
+
+    def test_without_a_configured_address_no_upload_context_passes(self):
+        with self.assertRaises(Refused):
+            check("POST", "/services", {}, self.body(self.BASE + "/internal/build-source/7/" + "b" * 43 + ".tar.gz"),
+                  CFG)
+
+    def test_the_setting_comes_from_the_environment(self):
+        self.assertEqual(coolifygw.settings({"GW_BUILD_SOURCE_URL": "http://10.0.0.5:8000/"})["build_source_url"],
+                         "http://10.0.0.5:8000")
+        self.assertEqual(coolifygw.settings({})["build_source_url"], self.BASE)     # the pinned website address
+        self.assertEqual(coolifygw.settings({"GW_BUILD_SOURCE_URL": "none"})["build_source_url"], "")

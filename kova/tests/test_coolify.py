@@ -102,11 +102,21 @@ class FakeCoolify:
             return {"message": "Validation failed.", "errors": {"name": ["The name format is invalid."]}}
         return None
 
+    @staticmethod
+    def _databases(svc):
+        """Coolify lists containers of database images (postgres, redis, ...) as databases."""
+        try:
+            services = json.loads(svc["compose"]).get("services") or {}
+        except (TypeError, ValueError):
+            return []
+        return [n for n, v in services.items() if isinstance(v, dict) and "image" in v]
+
     def _answer(self, uuid, svc):
         out = {"uuid": uuid, "name": self.app_name or svc["name"], "description": svc["description"],
                "service_type": None, "connect_to_docker_network": svc["connect"], "status": self._status(svc),
-               "applications": [{"name": n, "fqdn": svc["fqdn"].get(n)} for n in svc["containers"]],
-               "databases": []}
+               "applications": [{"name": n, "fqdn": svc["fqdn"].get(n)} for n in svc["containers"]
+                                if n not in self._databases(svc)],
+               "databases": [{"name": n} for n in self._databases(svc)]}
         if self.sensitive:
             out["docker_compose_raw"] = svc["compose"]
         return {**out, **self.service_extra}
@@ -728,6 +738,9 @@ class CoolifyTeardownTests(CoolifyCase):
 
         fake2 = FakeCoolify()
         self.as_student()
+        # The free plan allows one project for life; this test needs a second one, so treat the
+        # account as one that has not used its free window.
+        conn = self.app_conn(); conn.execute("UPDATE users SET free_started_at = NULL"); conn.commit()
         d = self.deploy_with(fake2)
         self.assertEqual(d["status"], "ready", d)
         with mock.patch("kova.engine.requests.request", side_effect=fake2):
@@ -842,7 +855,7 @@ class BuildIsolationTests(CoolifyCase):
         from kova.gitinfo import FRAMEWORKS
         fetched = []
         with mock.patch("kova.buildpolicy.fetch_dockerfile", side_effect=lambda *a, **k: fetched.append(a) or SAFE_DOCKERFILE):
-            for framework in [f for f in FRAMEWORKS if f != "docker"]:
+            for framework in [f for f in FRAMEWORKS if f not in ("docker", "compose")]:
                 with self.subTest(framework=framework):
                     self.upgrade_student()
                     d, fake = self.run_one(framework=framework, name=f"App {framework}")

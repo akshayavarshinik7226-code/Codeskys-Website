@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 import secrets
 from pathlib import Path
 
@@ -59,6 +60,15 @@ def build_config() -> dict:
         "SESSION_COOKIE_HTTPONLY": True,
         "SESSION_COOKIE_SAMESITE": "Lax",
         "SESSION_COOKIE_SECURE": os.environ.get("KOVA_COOKIE_SECURE", "0") == "1",
+        # Stay signed in for this many days (renewed on every visit) instead of until the browser closes.
+        "PERMANENT_SESSION_LIFETIME": timedelta(days=max(1, int(os.environ.get("KOVA_SESSION_DAYS", "30") or 30))),
+        # How many reverse proxies sit in front of the app (Caddy = 1). Needed to see each visitor's REAL
+        # address; without it every visitor shares the proxy's address and the sign-in limits trip for everyone.
+        "TRUSTED_PROXIES": int(os.environ.get("KOVA_TRUSTED_PROXIES", "1" if env == "production" else "0") or 0),
+        # One account per browser for ordinary users (administrators are exempt, so they can test other accounts).
+        "ONE_ACCOUNT_PER_BROWSER": os.environ.get("KOVA_ONE_ACCOUNT_PER_BROWSER", "1") == "1",
+        # A very high ceiling for guessing an ADMINISTRATOR password (it is never locked out, so nobody can lock you out).
+        "ADMIN_LOGIN_FAILS_PER_HOUR": 60,
         "ENCRYPTION_KEY": load_key(instance, env),
         # Coolify. Environment variables win over anything stored in the database.
         "COOLIFY_URL": os.environ.get("COOLIFY_URL", "").strip().rstrip("/"),
@@ -121,6 +131,21 @@ def build_config() -> dict:
         "GITLAB_CLIENT_ID": os.environ.get("GITLAB_CLIENT_ID", "").strip(),
         "GITLAB_CLIENT_SECRET": _file_or_env("GITLAB_CLIENT_SECRET"),
         "PUBLIC_URL": os.environ.get("KOVA_PUBLIC_URL", "").strip().rstrip("/"),
+        # Email sign-up verification (a 6-digit code). 1 = required (the default).
+        "EMAIL_OTP_REQUIRED": os.environ.get("KOVA_EMAIL_OTP", "1") == "1",
+        "OTP_MINUTES": int(os.environ.get("KOVA_OTP_MINUTES", "10")),
+        # Outgoing mail (SMTP). Works with Gmail, Brevo, SendGrid, Zoho or any SMTP server.
+        "SMTP_HOST": os.environ.get("KOVA_SMTP_HOST", "").strip(),
+        "SMTP_PORT": int(os.environ.get("KOVA_SMTP_PORT", "587") or 587),
+        "SMTP_USER": os.environ.get("KOVA_SMTP_USER", "").strip(),
+        "SMTP_PASSWORD": _file_or_env("KOVA_SMTP_PASSWORD"),
+        "SMTP_FROM": os.environ.get("KOVA_SMTP_FROM", "").strip(),
+        "SMTP_SECURITY": os.environ.get("KOVA_SMTP_SECURITY", "starttls").strip().lower(),
+        # Manual UPI payments (the owner approves each payment after checking the bank app).
+        "UPI_ENABLED": os.environ.get("KOVA_UPI", "1") == "1",
+        "UPI_ID": os.environ.get("KOVA_UPI_ID", "codeskysindia@okhdfcbank").strip(),
+        "UPI_NAME": os.environ.get("KOVA_UPI_NAME", "Codeskys").strip(),
+        "UPI_AID": os.environ.get("KOVA_UPI_AID", "uGICAgKCg58W_aw").strip(),
         "LOGIN_MAX_FAILURES": 5,
         "LOGIN_LOCK_MINUTES": 15,
         "VERSION": "1.1.0",
@@ -135,8 +160,13 @@ def build_config() -> dict:
         # set to 0 and run `python manage.py worker` separately in production.
         "INLINE_WORKER": os.environ.get("KOVA_INLINE_WORKER", "1") == "1",
         # Direct file upload (zip). The free-plan ceiling; see uploads.py.
-        "MAX_UPLOAD_MB": int(os.environ.get("KOVA_MAX_UPLOAD_MB", "500")),
+        "MAX_UPLOAD_MB": int(os.environ.get("KOVA_MAX_UPLOAD_MB", "100")),
         "MAX_UPLOAD_FILES": int(os.environ.get("KOVA_MAX_UPLOAD_FILES", "20000")),
+        # Where the build server fetches an uploaded application's source (an address of this
+        # website only the build server can reach, e.g. http://172.23.0.11:8000), and the
+        # caller addresses allowed (comma-separated CIDRs). Empty URL = uploads stay static-only.
+        "BUILD_SOURCE_URL": os.environ.get("KOVA_BUILD_SOURCE_URL", "").strip().rstrip("/"),
+        "BUILD_SOURCE_PEERS": os.environ.get("KOVA_BUILD_SOURCE_PEERS", "").strip(),
         # Wildcard domain for live links, e.g. "apps.codeskys.com" gives
         # https://<name>.apps.codeskys.com/. Empty = links look like /live/<name>/.
         "SITES_DOMAIN": os.environ.get("KOVA_SITES_DOMAIN", "").strip().lower().strip("."),

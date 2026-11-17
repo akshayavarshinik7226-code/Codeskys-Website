@@ -57,7 +57,7 @@ class Preflight(unittest.TestCase):
         self.assertIn("the module app that the start command runs is not in the top level", msg)
         self.assertIn("backend/main.py", msg)
         self.assertIn("frontend/app.py", msg)
-        self.assertIn("multi-service Docker Compose project", msg)
+        self.assertIn("choose Docker Compose (multi-service)", msg)
         self.assertIn("uvicorn backend.main:app --host 0.0.0.0 --port 8000 for a FastAPI app", msg)
         self.assertIn("gunicorn backend.main:app -b 0.0.0.0:8000 for a Flask app", msg)
         self.assertNotIn("tests/", msg)

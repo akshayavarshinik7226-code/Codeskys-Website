@@ -212,6 +212,7 @@ class EngineAuthorizationTests(CoolifyCase):
                 conn = self.app_conn()
                 conn.execute("DELETE FROM deployments")
                 conn.execute("DELETE FROM projects")
+                conn.execute("UPDATE users SET free_started_at = NULL")   # a fresh free account each round
                 conn.commit()
                 self.authz.calls.clear()
                 slug = self.linked_project()

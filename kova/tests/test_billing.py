@@ -17,6 +17,15 @@ from kova.db import connect
 from .base import ADMIN, STUDENT, AppTestCase
 
 KEY_ID, KEY_SECRET, WH_SECRET = "rzp_test_abc123", "test-key-secret-xyz", "test-webhook-secret-xyz"
+# The billing rules (signatures, refunds, renewals...) are exercised on a fixed test catalog: one offer
+# that changes the PLAN (pro, 6 months) and one that buys paid HOSTING (30 days). The real, shipped
+# prices (Rs 510 / 6 months and Rs 1,599 lifetime) are tested separately in DefaultCatalogTests.
+TEST_CATALOG = json.dumps({
+    "student-6m": {"name": "Student", "grants_plan": "pro", "amount": 51000, "currency": "INR",
+                   "period_days": 180, "description": "Codeskys Student plan, 6 months"},
+    "hosting-30d": {"name": "Paid Hosting", "grants_plan": "hosting", "amount": 51000, "currency": "INR",
+                    "period_days": 30, "description": "Keep your deployment live for 30 days"},
+})
 OTHER = ("ola@example.test", "Ola Other", "other-pass-1234567")
 
 
@@ -79,7 +88,8 @@ class BillingTests(AppTestCase):
 
     def configure(self, **env):
         base = {"RAZORPAY_KEY_ID": KEY_ID, "RAZORPAY_KEY_SECRET": KEY_SECRET,
-                "RAZORPAY_WEBHOOK_SECRET": WH_SECRET, "KOVA_BILLING_CHECKOUT": "1"}
+                "RAZORPAY_WEBHOOK_SECRET": WH_SECRET, "KOVA_BILLING_CHECKOUT": "1",
+                "KOVA_BILLING_PLANS_JSON": TEST_CATALOG}
         base.update(env)
         self.app.config["_BILLING"] = BillingConfig({k: v for k, v in base.items() if v is not None})
         self.app.config["BILLING_HTTP"] = self.rzp
@@ -140,10 +150,47 @@ class BillingTests(AppTestCase):
         self.login(ADMIN[0], ADMIN[2])
         self.assertTrue(any("KOVA_BILLING_CHECKOUT" in p for p in self.client.get("/api/admin/billing").get_json()["problems"]))
 
-    def test_default_catalog_is_student_500_for_6_months_only(self):
+    # ---- the prices that ship: Rs 510 for 6 months and Rs 1,599 for lifetime, both as paid hosting
+    def _use_default_catalog(self):
+        self.configure(KOVA_BILLING_PLANS_JSON=None)
+
+    def _buy(self, code):
+        o = self.order(code)
+        pid, sig = self.rzp.pay(o["order_id"])
+        self.assertEqual(self.verify(o["order_id"], pid, sig).status_code, 200)
+        return o
+
+    def test_default_catalog_is_510_for_6_months_and_1599_for_lifetime(self):
+        self._use_default_catalog()
         cat = self.app.config["_BILLING"].catalog
-        self.assertEqual(list(cat), ["student-6m"])                 # Premium is not sellable
-        self.assertEqual((cat["student-6m"]["amount"], cat["student-6m"]["period_days"]), (50000, 180))
+        self.assertEqual(list(cat), ["hosting-6m", "hosting-lifetime"])
+        self.assertEqual((cat["hosting-6m"]["amount"], cat["hosting-6m"]["period_days"], cat["hosting-6m"]["grants_plan"]),
+                         (51000, 180, "hosting"))
+        self.assertEqual((cat["hosting-lifetime"]["amount"], cat["hosting-lifetime"]["grants_plan"]), (159900, "hosting"))
+
+    def test_six_months_sets_hosting_for_about_180_days(self):
+        self._use_default_catalog()
+        self.as_student()
+        o = self._buy("hosting-6m")
+        self.assertEqual(o["amount"], 51000)
+        left = (datetime.fromisoformat(self.user(self.student_id)["hosting_until"]) - datetime.now(timezone.utc)).days
+        self.assertTrue(178 <= left <= 180, left)
+
+    def test_lifetime_sets_a_hosting_date_a_century_away_and_cannot_be_bought_twice(self):
+        self._use_default_catalog()
+        self.as_student()
+        o = self._buy("hosting-lifetime")
+        self.assertEqual(o["amount"], 159900)
+        self.assertGreaterEqual(int(self.user(self.student_id)["hosting_until"][:4]), 2100)
+        for code in ("hosting-lifetime", "hosting-6m"):
+            self.assertEqual(self.post("/api/billing/orders", {"plan": code}).status_code, 409, code)
+
+    def test_six_month_holder_can_upgrade_to_lifetime(self):
+        self._use_default_catalog()
+        self.as_student()
+        self._buy("hosting-6m")
+        self._buy("hosting-lifetime")
+        self.assertGreaterEqual(int(self.user(self.student_id)["hosting_until"][:4]), 2100)
 
     def test_live_keys_refused_without_explicit_opt_in(self):
         self.configure(RAZORPAY_KEY_ID="rzp_live_x")
@@ -183,8 +230,8 @@ class BillingTests(AppTestCase):
     def test_order_amount_comes_from_server_catalog(self):
         self.as_student()
         o = self.order()
-        self.assertEqual((o["amount"], o["currency"]), (50000, "INR"))
-        self.assertEqual(self.rzp.calls[-1][2]["amount"], 50000)
+        self.assertEqual((o["amount"], o["currency"]), (51000, "INR"))
+        self.assertEqual(self.rzp.calls[-1][2]["amount"], 51000)
         self.assertEqual(self.post("/api/billing/orders", {"plan": "free-stuff"}).status_code, 422)
 
     def test_order_requires_login_and_csrf(self):
@@ -334,11 +381,11 @@ class BillingTests(AppTestCase):
         self.assertEqual(r.status_code, 200, r.get_json())
         rid = r.get_json()["refund"]["id"]
         self.assertEqual(self.user(self.student_id)["plan"], "pro")   # pending refund: unchanged
-        self.hook("refund.processed", "refund", {"id": rid, "payment_id": pid, "amount": 50000, "status": "processed"})
+        self.hook("refund.processed", "refund", {"id": rid, "payment_id": pid, "amount": 51000, "status": "processed"})
         u = self.user(self.student_id)
         self.assertEqual((u["plan"], u["plan_expires_at"]), ("hobby", None))
         pay = [p for p in self.client.get("/api/admin/billing").get_json()["payments"] if p["ref"] == ref][0]
-        self.assertEqual((pay["status"], pay["refunded_amount"]), ("refunded", 50000))
+        self.assertEqual((pay["status"], pay["refunded_amount"]), ("refunded", 51000))
 
     def test_partial_refund_keeps_access(self):
         ref, pid = self._paid()
@@ -369,7 +416,8 @@ class BillingTests(AppTestCase):
         r = self.client.get(f"/billing/receipts/{o['ref']}")
         self.assertEqual(r.status_code, 200)
         self.assertIn("TEST MODE", r.get_data(as_text=True))
-        self.assertIn("INR 500.00", r.get_data(as_text=True))
+        self.assertIn("INR 510.00", r.get_data(as_text=True))
         other = self.app.test_client()
         self.login(OTHER[0], OTHER[2], client=other)
         self.assertEqual(other.get(f"/billing/receipts/{o['ref']}").status_code, 404)
+

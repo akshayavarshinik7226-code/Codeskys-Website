@@ -1,18 +1,20 @@
 """Projects, deployments, environment variables, domains, deploy hooks and analytics."""
 import re
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 import requests
 from flask import Blueprint, current_app, jsonify, request
 
-from . import engine
+from . import engine, plans
 from .crypto import secrets_for
 from .auth import current_user, login_required
 from .db import audit, get_db, utcnow
 from .composegen import coolify_reserved
 from .gitinfo import FRAMEWORKS, GitError, clean_root_dir, inspect_repo, parse_repo, resolve_tree
+from .plans import PlanBlocked
 from .providers import account_for, token_for, token_for_project
 from .ratelimit import rate_limit
 from .security import for_student
@@ -56,8 +58,36 @@ PLAN_LIMITS = {
 }
 
 
+# Link names that would collide with real services once links become <name>.<domain>.
+RESERVED_SLUGS = {"www", "api", "admin", "app", "apps", "mail", "ftp", "dashboard", "login", "static",
+                  "live", "sites", "docs", "status", "blog", "help", "support", "billing", "coolify",
+                  "authz", "smtp", "imap", "cdn", "ns1", "ns2", "assets", "codeskys", "kova"}
+CUSTOM_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$")
+
+
+class PlanGitError(GitError):
+    """The plan does not allow this deployment (HTTP 402, "upgrade required")."""
+    status = 402
+
+
 def err(message, code=400):
     return jsonify(error=message), code
+
+
+def _status_of(exc, default=409):
+    return getattr(exc, "status", default)
+
+
+def slug_problem(db, slug, project_id=None):
+    """Why ``slug`` cannot be a project's link name: (message, http status), or None if it is free."""
+    if not CUSTOM_SLUG_RE.match(slug or "") or "--" in slug:
+        return "A link name needs 3-48 lowercase letters, numbers or single hyphens.", 422
+    if slug in RESERVED_SLUGS:
+        return "That name is reserved. Choose another.", 422
+    row = db.execute("SELECT id FROM projects WHERE slug = ?", (slug,)).fetchone()
+    if row is not None and row["id"] != project_id:
+        return "That name is already taken. Choose another.", 409
+    return None
 
 
 def slugify(text: str) -> str:
@@ -86,10 +116,14 @@ def _is_admin() -> bool:
     return bool(user) and user["role"] == "admin"
 
 
-def _dep_public(d):
+def _dep_public(d, clock=None, latest_id=None):
     """A deployment as its owner sees it. Error and expiry notes pass through
     :func:`kova.security.for_student` (no keys, secrets or internal services);
-    administrators get the original text and the authorization reference."""
+    administrators get the original text and the authorization reference.
+
+    ``clock``: the project's single free expiry. Every deployment of a free project shows it, so
+    the history never shows a different expiry per redeploy. ``latest_id``: the project's newest
+    deployment; only that one may be redeployed, older ones are view-only history."""
     if d is None:
         return None
     admin = _is_admin()
@@ -102,12 +136,27 @@ def _dep_public(d):
     else:
         out |= {"authz_deployment_id": d["authz_deployment_id"] or None,
                 "credential_revoked": bool(d["authz_revoked_at"])}
-    return out | {
+    out = out | {
         "project_id": d["project_id"],
         # The UI must never present a simulated build as a real one.
         "is_simulated": d["provider"] == engine.SIMULATOR,
-        "is_upload": d["provider"] == engine.STATIC,
+        "is_upload": d["provider"] == engine.STATIC or d["trigger"] == "upload",
     }
+    if clock and out["expires_at"]:      # only a deployment that really has an expiry shows the project's one
+        out["expires_at"] = clock
+    if latest_id is not None:
+        out["is_latest"] = d["id"] == latest_id
+    return out
+
+
+def live_url(p, prod=None):
+    """The address a visitor opens: the real hosted link for uploads, the preview page otherwise."""
+    if p["source_type"] == "upload":
+        from . import uploads
+        return uploads.site_url(current_app.config, p["slug"])
+    if prod is not None and prod["provider"] == engine.COOLIFY and prod["url"]:
+        return prod["url"]
+    return f"/sites/{p['slug']}/"
 
 
 def _project_public(p, db=None, full=False):
@@ -115,16 +164,23 @@ def _project_public(p, db=None, full=False):
     current = db.execute("SELECT * FROM deployments WHERE id = ?", (p["current_deployment_id"],)).fetchone() \
         if p["current_deployment_id"] else None
     latest = db.execute("SELECT * FROM deployments WHERE project_id = ? ORDER BY id DESC LIMIT 1", (p["id"],)).fetchone()
-    owner = db.execute("SELECT name, email FROM users WHERE id = ?", (p["owner_id"],)).fetchone()
+    owner = db.execute("SELECT * FROM users WHERE id = ?", (p["owner_id"],)).fetchone()
     primary = db.execute("SELECT hostname FROM domains WHERE project_id = ? AND is_primary = 1 AND status = 'active'",
                          (p["id"],)).fetchone()
+    access = plans.state(db, p, owner)
+    clock = access["expires_at"] if access["is_free"] else None
+    latest_id = latest["id"] if latest else None
     out = {
         "id": p["id"], "name": p["name"], "slug": p["slug"], "description": p["description"],
         "repo_url": p["repo_url"], "repo_full_name": p["repo_full_name"], "branch": p["branch"],
         "framework": p["framework"], "framework_name": FRAMEWORKS.get(p["framework"], FRAMEWORKS["static"])["name"],
         "is_paused": bool(p["is_paused"]), "provider": p["provider"], "created_at": p["created_at"],
         "updated_at": p["updated_at"], "owner": {"name": owner["name"], "email": owner["email"]} if owner else None,
-        "production": _dep_public(current), "latest": _dep_public(latest),
+        # Paid hosting: while it runs, the project's deployments are not limited to 24 hours.
+        "hosting_until": (owner["hosting_until"] if owner and "hosting_until" in owner.keys() else None),
+        "production": _dep_public(current, clock, latest_id), "latest": _dep_public(latest, clock, latest_id),
+        "access": access, "live_url": live_url(p, current),
+        "link_editable": not p["provider_ref"],
         "primary_domain": primary["hostname"] if primary else None,
         "deploy_count": db.execute("SELECT COUNT(*) AS n FROM deployments WHERE project_id = ?", (p["id"],)).fetchone()["n"],
     }
@@ -170,6 +226,10 @@ def trigger_deployment(db, project, *, target="production", branch=None, trigger
     """
     if project["is_paused"]:
         raise GitError("This project is paused. Resume it in Settings to deploy.")
+    try:
+        plans.ensure_can_deploy(db, project)
+    except PlanBlocked as exc:
+        raise PlanGitError(exc.message)
     if project["source_type"] == "upload":
         raise GitError("This project was created from uploaded files. Upload your updated files to redeploy.")
     branch = branch or project["branch"]
@@ -227,7 +287,8 @@ _trigger = trigger_deployment
 @bp.get("/frameworks")
 @login_required
 def frameworks():
-    return jsonify(frameworks=[{"id": k, **v} for k, v in FRAMEWORKS.items()])
+    return jsonify(frameworks=[{"id": k, **v} for k, v in FRAMEWORKS.items()],
+                   max_upload_mb=current_app.config["MAX_UPLOAD_MB"])
 
 
 @bp.get("/git/inspect")
@@ -263,8 +324,10 @@ def overview():
     done = [d for d in deps if d["status"] in ("ready", "failed")]
     ok = [d for d in done if d["status"] == "ready"]
     durations = [d["duration_ms"] for d in ok if d["duration_ms"]]
-    recent = db.execute(f"SELECT d.*, p.name AS pname, p.slug AS pslug FROM deployments d JOIN projects p "
-                        f"ON p.id = d.project_id WHERE d.project_id IN ({q}) ORDER BY d.created_at DESC, d.id DESC LIMIT 8", ids).fetchall()
+    recent = db.execute(f"SELECT d.*, p.name AS pname, p.slug AS pslug, p.free_expires_at AS pclock, u.plan AS owner_plan, u.hosting_until AS owner_hosting, "
+                        f"(SELECT MAX(x.id) FROM deployments x WHERE x.project_id = d.project_id) AS latest_id "
+                        f"FROM deployments d JOIN projects p ON p.id = d.project_id JOIN users u ON u.id = p.owner_id "
+                        f"WHERE d.project_id IN ({q}) ORDER BY d.created_at DESC, d.id DESC LIMIT 8", ids).fetchall()
     return jsonify(
         stats={
             "projects": len(projects),
@@ -277,9 +340,10 @@ def overview():
         },
         daily=_daily(deps, 14),
         projects=[_project_public(p, db) for p in projects[:6]],
-        recent=[_dep_public(d) | {"project_name": d["pname"], "project_slug": d["pslug"]} for d in recent],
+        recent=[_dep_public(d, d["pclock"] if d["owner_plan"] == plans.FREE and not d["owner_hosting"] else None, d["latest_id"])
+                | {"project_name": d["pname"], "project_slug": d["pslug"]} for d in recent],
         provider=engine.active_provider(db, current_app.config),
-        plan=user["plan"], limits=PLAN_LIMITS.get(user["plan"], PLAN_LIMITS["hobby"]),
+        plan=user["plan"], limits=plans.limits_for(db, user),
     )
 
 
@@ -327,11 +391,16 @@ def create_project():
     name = str(data.get("name") or repo["repo"]).strip()[:64]
     if not name:
         return err("Give your project a name.")
-    limit = PLAN_LIMITS.get(user["plan"], PLAN_LIMITS["hobby"])["projects"]
+    limit = plans.project_limit(db, user)
     if user["role"] != "admin":
+        try:
+            plans.ensure_can_create(db, user)
+        except PlanBlocked as exc:
+            return err(exc.message, 402)
         count = db.execute("SELECT COUNT(*) AS n FROM projects WHERE owner_id = ?", (user["id"],)).fetchone()["n"]
         if count >= limit:
-            return err(f"Your {user['plan'].title()} plan allows {limit} projects. Delete one or upgrade.", 402)
+            return err(f"Your {user['plan'].title()} plan allows {limit} project{'s' if limit != 1 else ''}. "
+                       "Delete one or upgrade.", 402)
     framework = data.get("framework") or "static"
     if framework not in FRAMEWORKS:
         return err("Unknown framework preset.")
@@ -468,10 +537,26 @@ def update_project(slug):
         if flag in data:
             updates[flag] = 1 if data[flag] else 0
     if "ttl_hours" in data:
+        # The free 24 hours are a plan rule, so a student must not be able to lengthen them.
+        if current_user()["role"] != "admin":
+            return err("Only an administrator can change the deployment lifetime.", 403)
         ttl, ttl_err = _clean_ttl(data["ttl_hours"], db)
         if ttl_err:
             return err(ttl_err)
         updates["ttl_hours"] = ttl
+    new_slug = None
+    if "slug" in data:
+        wanted = str(data["slug"] or "").strip().lower()
+        if wanted and wanted != p["slug"]:
+            problem = slug_problem(db, wanted, p["id"])
+            if problem:
+                return err(*problem)
+            if p["provider_ref"]:
+                return err("The link of a running back-end app can't be renamed yet.", 409)
+            if rate_limit(db, f"rename:{current_user()['id']}", limit=10, per_seconds=3600):
+                return err("You've renamed projects a lot just now. Try again in a little while.", 429)
+            new_slug = wanted
+            updates["slug"] = new_slug
     # Build resource limits are admin-only: a student must not be able to hand
     # themselves the whole server.
     if current_user()["role"] == "admin":
@@ -502,12 +587,59 @@ def update_project(slug):
         return err("Nothing to update.")
     updates["updated_at"] = utcnow()
     cols = ", ".join(f"{k} = ?" for k in updates)
-    db.execute(f"UPDATE projects SET {cols} WHERE id = ?", (*updates.values(), p["id"]))
-    db.commit()
-    audit("project.updated", actor_id=current_user()["id"], target=slug, ip=request.remote_addr,
+    try:
+        db.execute(f"UPDATE projects SET {cols} WHERE id = ?", (*updates.values(), p["id"]))
+        if new_slug:
+            _move_links(db, p, new_slug)
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return err("That name is already taken. Choose another.", 409)
+    audit("project.updated", actor_id=current_user()["id"], target=new_slug or slug, ip=request.remote_addr,
           detail=", ".join(k for k in updates if k != "updated_at"), project_id=p["id"])
+    if new_slug:
+        audit("project.renamed", actor_id=current_user()["id"], target=new_slug, ip=request.remote_addr,
+              detail=f"link {slug} -> {new_slug}", project_id=p["id"])
     return jsonify(project=_project_public(db.execute("SELECT * FROM projects WHERE id = ?", (p["id"],)).fetchone(),
                                            db, full=True))
+
+
+def _move_links(db, p, new_slug):
+    """A project's name and its live link are one thing: when the link changes, everything that
+    mentions the old one (its built-in domain and each deployment's address) follows it."""
+    old = p["slug"]
+    for dom in db.execute("SELECT id, hostname FROM domains WHERE project_id = ? AND is_system = 1", (p["id"],)):
+        first, _, rest = dom["hostname"].partition(".")
+        if first == old:
+            db.execute("UPDATE domains SET hostname = ? WHERE id = ?", (f"{new_slug}.{rest}", dom["id"]))
+    for dep in db.execute("SELECT id, url FROM deployments WHERE project_id = ? AND url IS NOT NULL AND url != ''",
+                          (p["id"],)):
+        url = dep["url"]
+        for prefix in ("/sites/", "/live/"):
+            url = url.replace(f"{prefix}{old}/", f"{prefix}{new_slug}/")
+        url = re.sub(rf"^(https?://){re.escape(old)}\.", rf"\g<1>{new_slug}.", url)
+        if url != dep["url"]:
+            db.execute("UPDATE deployments SET url = ? WHERE id = ?", (url, dep["id"]))
+
+
+@bp.get("/projects/<slug>/link-check")
+@login_required
+def link_check(slug):
+    """Is the link made from this project name free? Powers the green tick beside the name."""
+    p = _load_project(slug)
+    if p is None:
+        return err("Project not found.", 404)
+    db = get_db()
+    user = current_user()
+    if rate_limit(db, f"linkcheck:{user['id']}", limit=120, per_seconds=60):
+        return err("Slow down a little.", 429)
+    name = str(request.args.get("name", "")).strip()
+    wanted = slugify(name) if name else ""
+    if not wanted:
+        return jsonify(slug="", available=False, same=False, reason="Type a project name.")
+    problem = slug_problem(db, wanted, p["id"])
+    return jsonify(slug=wanted, same=(wanted == p["slug"]), available=problem is None,
+                   reason=problem[0] if problem else None)
 
 
 @bp.delete("/projects/<slug>")
@@ -592,7 +724,7 @@ def deploy(slug):
                                     trigger="redeploy-clear-cache" if data.get("clear_cache") else "manual",
                                     user_id=user["id"])
     except GitError as exc:
-        return err(str(exc), 409)
+        return err(str(exc), _status_of(exc))
     audit("deploy.triggered", actor_id=current_user()["id"], target=f"#{dep_id}", project_id=p["id"])
     return jsonify(deployment=_dep_public(db.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone())), 201
 
@@ -603,9 +735,14 @@ def project_deployments(slug):
     p = _load_project(slug)
     if p is None:
         return err("Project not found.", 404)
-    rows = get_db().execute("SELECT * FROM deployments WHERE project_id = ? ORDER BY id DESC LIMIT 200",
-                            (p["id"],)).fetchall()
-    return jsonify(deployments=[_dep_public(d) for d in rows], current_id=p["current_deployment_id"])
+    db = get_db()
+    rows = db.execute("SELECT * FROM deployments WHERE project_id = ? ORDER BY id DESC LIMIT 200",
+                      (p["id"],)).fetchall()
+    access = plans.state(db, p)
+    clock = access["expires_at"] if access["is_free"] else None
+    latest_id = db.execute("SELECT MAX(id) AS m FROM deployments WHERE project_id = ?", (p["id"],)).fetchone()["m"]
+    return jsonify(deployments=[_dep_public(d, clock, latest_id) for d in rows], current_id=p["current_deployment_id"],
+                   latest_id=latest_id, access=access)
 
 
 @bp.get("/deployments")
@@ -621,13 +758,22 @@ def all_deployments():
     if status in ("queued", "building", "ready", "failed", "cancelled"):
         where.append("d.status = ?")
         args.append(status)
-    sql = ("SELECT d.*, p.name AS pname, p.slug AS pslug, p.current_deployment_id AS cur FROM deployments d "
-           "JOIN projects p ON p.id = d.project_id")
+    sql = ("SELECT d.*, p.name AS pname, p.slug AS pslug, p.current_deployment_id AS cur, "
+           "p.free_expires_at AS pclock, u.plan AS owner_plan, u.hosting_until AS owner_hosting, "
+           "(SELECT MAX(x.id) FROM deployments x WHERE x.project_id = d.project_id) AS latest_id "
+           "FROM deployments d JOIN projects p ON p.id = d.project_id JOIN users u ON u.id = p.owner_id")
     if where:
         sql += " WHERE " + " AND ".join(where)
     rows = db.execute(sql + " ORDER BY d.created_at DESC, d.id DESC LIMIT 300", args).fetchall()
-    return jsonify(deployments=[_dep_public(d) | {"project_name": d["pname"], "project_slug": d["pslug"],
-                                                 "is_current": d["cur"] == d["id"]} for d in rows])
+    return jsonify(deployments=[_dep_public(d, d["pclock"] if d["owner_plan"] == plans.FREE and not d["owner_hosting"] else None, d["latest_id"])
+                                | {"project_name": d["pname"], "project_slug": d["pslug"],
+                                   "is_current": d["cur"] == d["id"]} for d in rows])
+
+
+def _is_latest(db, d) -> bool:
+    """Only a project's newest deployment may be redeployed or published."""
+    row = db.execute("SELECT MAX(id) AS m FROM deployments WHERE project_id = ?", (d["project_id"],)).fetchone()
+    return row["m"] == d["id"]
 
 
 def _load_deployment(dep_id):
@@ -654,7 +800,11 @@ def get_deployment(dep_id):
         if d["triggered_by"] else None
     ahead = get_db().execute("SELECT COUNT(*) AS n FROM deployments WHERE status IN ('queued','building') "
                              "AND id < ?", (d["id"],)).fetchone()["n"] if d["status"] in ("queued", "building") else 0
-    return jsonify(deployment=_dep_public(d) | {"is_current": p["current_deployment_id"] == d["id"],
+    access = plans.state(get_db(), p)
+    latest_id = get_db().execute("SELECT MAX(id) AS m FROM deployments WHERE project_id = ?", (p["id"],)).fetchone()["m"]
+    clock = access["expires_at"] if access["is_free"] else None
+    return jsonify(access=access, live_url=live_url(p, d),
+                   deployment=_dep_public(d, clock, latest_id) | {"is_current": p["current_deployment_id"] == d["id"],
                                                 "builds_ahead": ahead,
                                                 "triggered_by": user["name"] if user else None,
                                                 "project_slug": p["slug"], "project_name": p["name"],
@@ -684,12 +834,17 @@ def redeploy(dep_id):
     if d is None:
         return err("Deployment not found.", 404)
     db = get_db()
+    if not _is_latest(db, d):
+        return err("Only the latest deployment can be redeployed. Older deployments are kept as history.", 409)
+    # Redeploy means "publish my project as it is NOW": the project's current branch and the newest
+    # commit on it (looked up fresh), not the old deployment's commit. Settings changed on the
+    # platform are read from the project when the build runs, so they are included too.
+    branch = d["branch"] if d["target"] == "preview" else p["branch"]
     try:
-        new_id = trigger_deployment(db, p, target=d["target"], branch=d["branch"], trigger="redeploy",
-                                    user_id=current_user()["id"], commit_sha=d["commit_sha"],
-                                    commit_message=d["commit_message"])
+        new_id = trigger_deployment(db, p, target=d["target"], branch=branch, trigger="redeploy",
+                                    user_id=current_user()["id"])
     except GitError as exc:
-        return err(str(exc), 409)
+        return err(str(exc), _status_of(exc))
     return jsonify(deployment=_dep_public(db.execute("SELECT * FROM deployments WHERE id = ?", (new_id,)).fetchone())), 201
 
 
@@ -703,15 +858,15 @@ def promote(dep_id):
     if d["status"] != "ready":
         return err("Only successful deployments can be published.", 409)
     db = get_db()
-    if d["status"] == "expired":
-        return err("This deployment has expired. Redeploy the project instead.", 409)
+    if not _is_latest(db, d):
+        return err("Only the latest deployment can be published. Older deployments are kept as history.", 409)
     if d["provider"] == engine.COOLIFY:
         try:
             new_id = trigger_deployment(db, p, target="production", branch=d["branch"], trigger="rollback",
                                         user_id=current_user()["id"], commit_sha=d["commit_sha"],
                                         commit_message=f"Rollback to #{d['number']}: {d['commit_message']}")
         except GitError as exc:
-            return err(str(exc), 409)
+            return err(str(exc), _status_of(exc))
         return jsonify(deployment_id=new_id, mode="rebuild")
     db.execute("UPDATE projects SET current_deployment_id = ?, updated_at = ? WHERE id = ?", (d["id"], utcnow(), p["id"]))
     db.commit()

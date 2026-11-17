@@ -78,8 +78,12 @@ def _trigger(conn, project, branch, sha, message, provider, delivery_id):
         "AND status IN ('queued','building') ORDER BY id DESC LIMIT 1", (project["id"], sha)).fetchone()
     if existing:
         return False, f"Commit {sha[:7]} is already building (deployment #{existing['id']})."
-    dep_id = trigger_deployment(conn, project, branch=branch or project["branch"], trigger=f"{provider}-push",
-                                commit_sha=sha, commit_message=message)
+    from .gitinfo import GitError
+    try:
+        dep_id = trigger_deployment(conn, project, branch=branch or project["branch"], trigger=f"{provider}-push",
+                                    commit_sha=sha, commit_message=message)
+    except GitError as exc:
+        return False, str(exc)
     audit("deploy.webhook", target=f"#{dep_id}", detail=f"{provider} {delivery_id}"[:200],
           ip=request.remote_addr, project_id=project["id"])
     return True, dep_id

@@ -187,6 +187,19 @@ def sweep(conn, app_config):
         if enqueue(conn, "expire", {"deployment_id": row["id"]}, dedupe_key=f"expire:{row['id']}"):
             queued += 1
 
+    # Paid hosting that just ended: one reminder per period while the 24 h grace still runs.
+    from . import engine                       # lazy: engine imports this module
+    grace_start = (datetime.now(timezone.utc) - engine.HOSTING_GRACE).isoformat(timespec="seconds")
+    for u in conn.execute("SELECT id, hosting_until FROM users WHERE hosting_until IS NOT NULL AND hosting_until <= ? "
+                          "AND hosting_until > ? AND (hosting_reminded IS NULL OR hosting_reminded != hosting_until)",
+                          (now, grace_start)).fetchall():
+        if conn.execute("UPDATE users SET hosting_reminded = ? WHERE id = ? AND hosting_until = ? "
+                        "AND (hosting_reminded IS NULL OR hosting_reminded != hosting_until)",
+                        (u["hosting_until"], u["id"], u["hosting_until"])).rowcount:
+            engine._notify(conn, u["id"], "billing", "Paid hosting ended",
+                           "Your deployments stay live for 24 more hours. Renew Paid Hosting (₹510 for 30 days) "
+                           "to keep them running; after that they expire like a free deployment.", "#/billing")
+
     # Catch-up for anything a handler could not finish: a credential still unrevoked
     # on a deployment that is over, or an expired app still present on Coolify.
     # Both enqueue with a fixed dedupe key, so this is a no-op while a retry is queued.

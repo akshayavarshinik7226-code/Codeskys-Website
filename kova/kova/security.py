@@ -57,7 +57,7 @@ def redact(text) -> str:
 _INTERNAL = re.compile(
     r"(?i)private[\s_-]*key|ssh[\s_-]*key|-----BEGIN|\bpem\b|signing[\s_-]*(?:key|secret)|"
     r"encryption[\s_-]*key|secret[\s_-]*(?:file|key|token)|runtime[\s_-]*secret|credential|"
-    r"\bauthz\b|forgeops|runtime[\s_-]*(?:proxy|gateway)|\bsidecar\b|introspect|"
+    r"\bauthz\b|forgeops(?!/)|runtime[\s_-]*(?:proxy|gateway)|\bsidecar\b|introspect|"
     r"(?:website|internal|admin|data[\s_-]*api)[\s_-]*key|api[\s_-]*token|access[\s_-]*token")
 STUDENT_UNAVAILABLE = "Deployment unavailable. Please contact support."
 

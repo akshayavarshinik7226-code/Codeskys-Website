@@ -20,23 +20,32 @@ Safety rules, all enforced before a single file is published:
 * uploaded pages are served with a CSP ``sandbox`` so they can never read the
   dashboard's session, even when served from the same origin as the dashboard.
 """
+import base64
 import hashlib
+import hmac
+import ipaddress
+import json
 import os
 import re
 import secrets
 import shutil
+import tarfile
+import threading
 import time
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import (Blueprint, current_app, g, jsonify, redirect, render_template, request,
-                   send_from_directory)
+                   send_file, send_from_directory)
 
 from . import engine
 from .auth import current_user, login_required
 from .db import audit, get_db, utcnow
-from .projects import (PLAN_LIMITS, _clean_ttl, _dep_public, _load_project, _project_public,
-                       _system_domain, _unique_slug, err, in_flight, slugify)
+from . import plans
+from .plans import PlanBlocked
+from .projects import (CUSTOM_SLUG_RE, PLAN_LIMITS, RESERVED_SLUGS, _clean_ttl, _dep_public, _load_project,
+                       _project_public, _system_domain, _unique_slug, err, in_flight, slugify)
 from .ratelimit import rate_limit
 
 bp = Blueprint("uploads", __name__)
@@ -47,11 +56,8 @@ SKIP_FILES = {".ds_store", "thumbs.db"}
 BLOCKED_EXT = {".exe", ".dll", ".bat", ".cmd", ".com", ".msi", ".scr", ".ps1", ".vbs", ".jar",
                ".apk", ".dmg", ".sh", ".bin"}
 BUILD_DIRS = ("dist", "build", "public", "out", "www", "site", "_site")
-# Slugs that would collide with real services once links become <name>.<domain>.
-RESERVED_SLUGS = {"www", "api", "admin", "app", "apps", "mail", "ftp", "dashboard", "login", "static",
-                  "live", "sites", "docs", "status", "blog", "help", "support", "billing", "coolify",
-                  "authz", "smtp", "imap", "cdn", "ns1", "ns2", "assets", "codeskys", "kova"}
-CUSTOM_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$")
+# RESERVED_SLUGS and CUSTOM_SLUG_RE (what a link name may be) live in projects.py so that
+# renaming a project and uploading one follow exactly the same rules.
 
 
 class UploadError(ValueError):
@@ -123,8 +129,9 @@ def _skip_reason(parts, is_dir):
     return None
 
 
-def unpack(zip_path: Path, dest: Path, *, max_bytes: int, max_files: int, log=None):
-    """Safely extract ``zip_path`` into ``dest`` and return ``(site_root, stats)``."""
+def unpack(zip_path: Path, dest: Path, *, max_bytes: int, max_files: int, log=None, site=True):
+    """Safely extract ``zip_path`` into ``dest`` and return ``(site_root, stats)``.
+    With ``site=False`` (source for a build) no index.html is needed and ``dest`` is returned."""
     log = log or (lambda msg, level="info": None)
     if not zipfile.is_zipfile(zip_path):
         raise UploadError("That file is not a valid .zip. Compress your project folder as a ZIP and upload again.")
@@ -187,7 +194,7 @@ def unpack(zip_path: Path, dest: Path, *, max_bytes: int, max_files: int, log=No
         log(f"…and {len(skipped) - 20} more skipped files", "warn")
     if count == 0:
         raise UploadError("The zip has no publishable files.")
-    root = find_site_root(dest)
+    root = find_site_root(dest) if site else dest
     return root, {"files": count, "bytes": written, "skipped": len(skipped)}
 
 
@@ -207,6 +214,10 @@ def find_site_root(dest: Path) -> Path:
     for name in BUILD_DIRS:
         if (root / name / "index.html").is_file():
             return root / name
+    files = {p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()}
+    from .projectscan import choose, refusal
+    if not any(f.endswith((".html", ".htm")) for f in files) and choose(files, lambda _p: None) is None:
+        raise UploadError(refusal(files))
     raise UploadError("No index.html was found. A website needs an index.html at the top of the zip "
                       "(or inside a dist / build folder). If your project needs a build step, "
                       "run it first and zip the output folder.")
@@ -219,10 +230,15 @@ def remove_deployment_files(cfg, dep) -> bool:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
         removed = True
-    zp = staged_zip(cfg, dep["project_id"], dep["id"])
-    if zp.exists():
-        zp.unlink(missing_ok=True)
-        removed = True
+    extra = sorted((upload_root(cfg) / str(dep["project_id"])).glob(f"{dep['id']}.src*"))
+    for zp in (staged_zip(cfg, dep["project_id"], dep["id"]), *_source_files(cfg, dep["project_id"], dep["id"]),
+               *extra):
+        if zp.exists():
+            try:
+                zp.unlink(missing_ok=True)
+                removed = True
+            except OSError:
+                pass                 # still open somewhere: the scheduler's sweep retries
     return removed
 
 
@@ -248,6 +264,13 @@ def sweep_files(conn, cfg) -> int:
                         "ORDER BY id DESC LIMIT 500", (engine.STATIC,)).fetchall()
     for dep in rows:
         if discard_deployment(conn, cfg, dep):
+            cleaned += 1
+    # Uploaded source built by the deployment engine is only needed while it builds.
+    rows = conn.execute("SELECT * FROM deployments WHERE provider = ? AND trigger = 'upload' "
+                        "AND status NOT IN ('queued','building') ORDER BY id DESC LIMIT 500",
+                        (engine.COOLIFY,)).fetchall()
+    for dep in rows:
+        if remove_deployment_files(cfg, dep):
             cleaned += 1
     incoming = upload_root(cfg) / "_incoming"
     if incoming.is_dir():
@@ -276,6 +299,305 @@ def cleanup_superseded(conn, cfg, project, keep_dep_id):
                      ("Replaced by a newer upload; its files were removed.", row["id"]))
     if rows:
         conn.commit()
+
+
+# ------------------------------------------------------------------ source projects
+#
+# A zip that holds an application (package.json, requirements.txt, manage.py or a
+# Dockerfile) instead of a finished site is built by the deployment engine exactly like
+# a GitHub repository: same framework presets, generated Dockerfile, build policy and
+# isolated service. Only the build context differs. The worker unpacks the zip with the
+# rules above, packs it as a .tar.gz and the build server fetches it once or twice from
+# /internal/build-source/<deployment>/<token>.tar.gz:
+#
+# * /internal* is blocked on the public site by Caddy, and a request that came through a
+#   proxy (X-Forwarded-For / Forwarded) is refused here as well;
+# * KOVA_BUILD_SOURCE_PEERS limits the callers to the build server's address;
+# * the token is an HMAC of the deployment id and the archive's sha256 (never stored,
+#   never shown to the student), and it only works while that deployment is building,
+#   within BUILD_TIMEOUT, for at most SOURCE_FETCH_LIMIT requests;
+# * the archive is deleted as soon as the deployment ends (ready, failed or cancelled).
+
+SOURCE_MARKERS = ("package.json", "requirements.txt", "manage.py", "Dockerfile")
+MAX_MANIFEST_BYTES = 512 * 1024
+SOURCE_FETCH_LIMIT = 10          # BuildKit reads a remote context twice per build
+SECRET_SCAN_MAX_FILE = 1024 * 1024
+SECRET_SCAN_MAX_TOTAL = 64 * 1024 * 1024
+_SECRET_PATTERNS = (
+    ("a certificate-style key block", re.compile(rb"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
+    ("an AWS access key id", re.compile(rb"\bAKIA[0-9A-Z]{16}\b")),
+    ("a GitHub token", re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,})\b")),
+    ("an OpenAI-style API key", re.compile(rb"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
+    ("a Slack token", re.compile(rb"\bxox[abpr]-[A-Za-z0-9-]{10,}")),
+    ("a Google API key", re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b")),
+)
+
+
+def _source_files(cfg, project_id, dep_id, n: int = 0):
+    """(archive, sha256 file, fetch counter) of build context ``n`` (0 = the whole project)."""
+    base, tag = upload_root(cfg) / str(project_id), f"{dep_id}.src" + (f"-{int(n)}" if n else "")
+    return base / f"{tag}.tar.gz", base / f"{tag}.sha256", base / f"{tag}.fetches"
+
+
+def _members(zf):
+    """Relative paths of the files that would be extracted (the same skip rules as unpack)."""
+    out = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        try:
+            parts = _clean_member(info.filename)
+        except UploadError:
+            continue
+        if parts and not _skip_reason(parts, False) and parts[-1].lower() not in SKIP_FILES:
+            out.append(("/".join(parts), info))
+    return out
+
+
+def _source_root(paths) -> str:
+    """The folder holding the project: the top, or up to three single wrapper folders down."""
+    prefix = ""
+    for _ in range(4):
+        rel = [p[len(prefix):] for p in paths if p.startswith(prefix)]
+        if any("/" not in p for p in rel):
+            return prefix
+        dirs = {p.split("/", 1)[0] for p in rel}
+        if len(dirs) != 1:
+            return prefix
+        prefix += dirs.pop() + "/"
+    return prefix
+
+
+def source_plan(zip_path: Path, root_dir: str = ""):
+    """``{"root", "framework"}`` when the zip is a project the deployment engine must build,
+    None when it is a finished site (served directly, as before). ``root_dir`` is the project's
+    Root directory setting, inside the upload. Never raises."""
+    from .gitinfo import FRAMEWORKS
+    from .projectscan import choose
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            members = dict(_members(zf))
+            root = _source_root(list(members))
+            sub = (root_dir or "").strip("/")
+            base = root + (sub + "/" if sub else "")
+            rel = {p[len(base):] for p in members if p.startswith(base)}
+
+            def read(name):
+                info = members.get(base + name)
+                if info is None or info.file_size > MAX_MANIFEST_BYTES:
+                    return None
+                return zf.read(info).decode("utf-8", errors="replace")
+            framework, inner_root = choose(rel, read), ""
+            if framework in (None, "docs") and not sub:
+                # Nothing to run at the top, but an app one or two folders down (backend/, app/web/).
+                from .projectscan import nested_root
+                inner_root = nested_root(rel)
+                if inner_root:
+                    inner = choose({p[len(inner_root) + 1:] for p in rel if p.startswith(inner_root + "/")},
+                                   lambda p: read(f"{inner_root}/{p}"))
+                    if inner and inner not in ("docs", "static"):
+                        return {"root": root.rstrip("/"), "framework": inner, "root_dir": inner_root}
+    except (zipfile.BadZipFile, OSError, RuntimeError):
+        return None
+    fw = FRAMEWORKS.get(framework or "")
+    if fw is None or framework == "static":
+        return None
+    if fw["static"] and fw["output"] and f"{fw['output']}/index.html" in rel:
+        return None          # the built site is already in the zip: publish it, as before
+    return {"root": root.rstrip("/"), "framework": framework}
+
+
+def source_builds_enabled(conn, cfg) -> bool:
+    """Source zips are built only when the real engine and the build-source address are set."""
+    return bool(cfg.get("BUILD_SOURCE_URL")) and engine.active_provider(conn, cfg) == engine.COOLIFY
+
+
+def framework_family(framework: str) -> str:
+    """Presets that build and run the same way (a student's own settings carry over inside one)."""
+    from .dockerfiles import PYTHON_FRAMEWORKS
+    from .gitinfo import FRAMEWORKS
+    if framework in ("docker", "static") or framework not in FRAMEWORKS:
+        return framework
+    if framework in PYTHON_FRAMEWORKS:
+        return "python"
+    return "node-site" if FRAMEWORKS[framework]["static"] else "node-app"
+
+
+def build_source_token(cfg, dep_id: int, digest: str, n: int = 0) -> str:
+    key = hashlib.sha256(b"codeskys-build-source\0" + str(cfg["SECRET_KEY"]).encode()).digest()
+    msg = f"{int(dep_id)}:{digest}" if not n else f"{int(dep_id)}:{int(n)}:{digest}"
+    mac = hmac.new(key, msg.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).rstrip(b"=").decode("ascii")
+
+
+def build_source_url(cfg, dep_id: int, digest: str, n: int = 0) -> str:
+    return (f"{cfg['BUILD_SOURCE_URL'].rstrip('/')}/internal/build-source/{int(dep_id)}/"
+            f"{build_source_token(cfg, dep_id, digest, n)}" + (f"-{int(n)}" if n else "") + ".tar.gz")
+
+
+def _digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stage_subcontext(cfg, project, dep, folder: str, n: int) -> str:
+    """Build context ``n``: the ``folder`` of the staged project, as its own archive (a
+    multi-service project builds each service from its own folder). Returns its URL."""
+    folder = folder.strip("/")
+    whole = _source_files(cfg, project["id"], dep["id"])[0]
+    tar_path, sha_path, count_path = _source_files(cfg, project["id"], dep["id"], n)
+    count = 0
+    with tarfile.open(whole, "r:gz") as src, tarfile.open(tar_path, "w:gz", compresslevel=6) as out:
+        for member in src.getmembers():
+            if member.isfile() and member.name.startswith(folder + "/"):
+                info = tarfile.TarInfo(member.name[len(folder) + 1:])
+                info.size, info.mode, info.mtime = member.size, member.mode, member.mtime
+                out.addfile(info, src.extractfile(member))
+                count += 1
+    if not count:
+        tar_path.unlink(missing_ok=True)
+        raise UploadError(f"The folder {folder}/ is empty or not in the upload.")
+    digest = _digest(tar_path)
+    sha_path.write_text(digest)
+    count_path.unlink(missing_ok=True)
+    return build_source_url(cfg, dep["id"], digest, n)
+
+
+def scan_secrets(root: Path):
+    """``[(relative path, kind)]`` of files that look like they hold a live key or token."""
+    found, total = [], 0
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        size = path.stat().st_size
+        if size > SECRET_SCAN_MAX_FILE or total + size > SECRET_SCAN_MAX_TOTAL:
+            continue
+        total += size
+        data = path.read_bytes()
+        for kind, pattern in _SECRET_PATTERNS:
+            if pattern.search(data):
+                found.append((path.relative_to(root).as_posix(), kind))
+                break
+    return found
+
+
+def stage_build_source(cfg, project, dep, log) -> dict:
+    """Unpack the deployment's zip and pack the build context. Raises UploadError."""
+    zip_path = staged_zip(cfg, project["id"], dep["id"])
+    if not zip_path.is_file():
+        raise UploadError("The uploaded file is missing on the server. Please upload again.")
+    dest = site_dir(cfg, project["id"], dep["id"])
+    _, stats = unpack(zip_path, dest, max_bytes=int(cfg["MAX_UPLOAD_MB"]) * 1024 * 1024,
+                      max_files=int(cfg["MAX_UPLOAD_FILES"]), log=log, site=False)
+    root = dest
+    with zipfile.ZipFile(zip_path) as zf:
+        plan_root = _source_root([p for p, _ in _members(zf)]).rstrip("/")
+    if plan_root:
+        root = dest.joinpath(*plan_root.split("/"))
+    sub = (project["root_dir"] or "").strip("/")
+    if sub:
+        root = root.joinpath(*sub.split("/"))
+        if not root.is_dir():
+            raise UploadError(f"The root directory {sub}/ is not in the uploaded files. "
+                              "Fix it in Project → Settings, or upload again.")
+    for rel, kind in scan_secrets(root)[:10]:
+        log(f"Warning: {rel} looks like it contains {kind}. It becomes part of your app; keep such values in "
+            "Project → Settings → Environment variables instead.", "warn")
+    tar_path, sha_path, count_path = _source_files(cfg, project["id"], dep["id"])
+    files = set()
+    with tarfile.open(tar_path, "w:gz", compresslevel=6) as tar:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            rel = path.relative_to(root).as_posix()
+            info = tar.gettarinfo(str(path), arcname=rel)
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o755 if info.mode & 0o111 else 0o644
+            with open(path, "rb") as fh:
+                tar.addfile(info, fh)
+            files.add(rel)
+    if not files:
+        raise UploadError("The uploaded project folder is empty.")
+    digest = _digest(tar_path)
+    sha_path.write_text(digest)
+    count_path.unlink(missing_ok=True)
+    shutil.rmtree(dest, ignore_errors=True)        # the archive is all the build needs
+    return {"url": build_source_url(cfg, dep["id"], digest), "files": files, "root": root,
+            "count": len(files), "bytes": tar_path.stat().st_size, "skipped": stats["skipped"]}
+
+
+def read_source_file(cfg, project, dep, name: str):
+    """One file of the staged build context as text (e.g. the Dockerfile), or None."""
+    tar_path = _source_files(cfg, project["id"], dep["id"])[0]
+    try:
+        with tarfile.open(tar_path, "r:gz") as tar:
+            member = tar.getmember(name)
+            if not member.isfile() or member.size > MAX_MANIFEST_BYTES:
+                return None
+            return tar.extractfile(member).read().decode("utf-8", errors="replace")
+    except (KeyError, OSError, tarfile.TarError):
+        return None
+
+
+def _peer_allowed(addr: str, peers: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr or "")
+        return any(ip in ipaddress.ip_network(p.strip(), strict=False) for p in peers.split(",") if p.strip())
+    except ValueError:
+        return False
+
+
+_fetch_lock = threading.Lock()
+
+
+@bp.get("/internal/build-source/<int:dep_id>/<token>.tar.gz")
+def build_source(dep_id, token):
+    """The build server's one way to read an uploaded project. Anything wrong is a plain 404."""
+    cfg = current_app.config
+    nothing = current_app.response_class("Not found", status=404, mimetype="text/plain")
+    if not cfg.get("BUILD_SOURCE_URL") or "X-Forwarded-For" in request.headers or "Forwarded" in request.headers:
+        return nothing
+    if cfg.get("BUILD_SOURCE_PEERS") and not _peer_allowed(request.remote_addr, cfg["BUILD_SOURCE_PEERS"]):
+        return nothing
+    db = get_db()
+    dep = db.execute("SELECT * FROM deployments WHERE id = ?", (dep_id,)).fetchone()
+    if (dep is None or dep["trigger"] != "upload" or dep["provider"] != engine.COOLIFY
+            or dep["status"] not in ("queued", "building")):
+        return nothing
+    try:
+        begun = datetime.fromisoformat(dep["started_at"] or dep["created_at"])
+    except (TypeError, ValueError):
+        return nothing
+    if datetime.now(timezone.utc) - begun > timedelta(seconds=engine.BUILD_TIMEOUT):
+        return nothing
+    m = re.fullmatch(r"([A-Za-z0-9_-]{43})(?:-([1-9][0-9]?))?", token)
+    if m is None:
+        return nothing
+    token, n = m.group(1), int(m.group(2) or 0)
+    tar_path, sha_path, count_path = _source_files(cfg, dep["project_id"], dep_id, n)
+    try:
+        digest = sha_path.read_text().strip()
+    except OSError:
+        return nothing
+    if not tar_path.is_file() or not hmac.compare_digest(token, build_source_token(cfg, dep_id, digest, n)):
+        return nothing
+    with _fetch_lock:
+        try:
+            count = int(count_path.read_text() or 0) + 1
+        except (OSError, ValueError):
+            count = 1
+        if count > SOURCE_FETCH_LIMIT:
+            return nothing
+        count_path.write_text(str(count))
+    if count == 1 and n == 0:
+        db.execute("INSERT INTO deploy_logs (deployment_id, ts, level, stage, line) VALUES (?,?,?,?,?)",
+                   (dep_id, utcnow(), "info", "building", "The build server received the uploaded source."))
+        db.commit()
+    resp = send_file(tar_path, mimetype="application/gzip", conditional=False, max_age=0)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ------------------------------------------------------------------ serving
@@ -406,13 +728,38 @@ def _queue_upload(db, project, user_id, tmp: Path, filename: str):
     if same is not None:            # the same file sent twice (double click, retry)
         tmp.unlink(missing_ok=True)
         return same
+    # An application (not a finished site) goes to the deployment engine, built like a repository.
+    plan = source_plan(tmp, project["root_dir"] or "") if source_builds_enabled(db, cfg) else None
+    provider, note = engine.STATIC, ""
+    if plan is not None:
+        from .gitinfo import FRAMEWORKS
+        provider = engine.COOLIFY
+        detected = plan["framework"]
+        if plan.get("root_dir") and not project["root_dir"]:
+            db.execute("UPDATE projects SET root_dir = ? WHERE id = ?", (plan["root_dir"], project["id"]))
+            project = db.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
+        current = FRAMEWORKS.get(project["framework"], FRAMEWORKS["static"])
+        customised = any(project[k] for k in ("install_command", "build_command", "output_dir", "start_command")) \
+            or (project["port"] and int(project["port"]) != int(current["port"]))
+        if not customised or framework_family(project["framework"]) != framework_family(detected):
+            # Untouched settings follow the upload; a different kind of project starts from its preset.
+            db.execute("UPDATE projects SET framework = ?, port = ?, install_command = '', build_command = '', "
+                       "output_dir = '', start_command = '' WHERE id = ?",
+                       (detected, FRAMEWORKS[detected]["port"], project["id"]))
+            project = db.execute("SELECT * FROM projects WHERE id = ?", (project["id"],)).fetchone()
+        note = f"Detected a {FRAMEWORKS[detected]['name']} project"
+        if plan.get("root_dir"):
+            note += f" in {plan['root_dir']}/ (Root directory set to {project['root_dir'] + '/' if project['root_dir'] else '.'}; change it in Settings)"
+        if project["framework"] != detected:
+            note += f"; building it with your {FRAMEWORKS[project['framework']]['name']} settings"
+        note += "."
     number = db.execute("SELECT COALESCE(MAX(number), 0) + 1 AS n FROM deployments WHERE project_id = ?",
                         (project["id"],)).fetchone()["n"]
     cur = db.execute(
         "INSERT INTO deployments (project_id, number, status, stage, target, branch, commit_sha, commit_message, "
         "trigger, triggered_by, provider, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (project["id"], number, "queued", "queued", "production", "upload", digest,
-         f"Uploaded {os.path.basename(filename)[:80]} ({_human(size)})", "upload", user_id, engine.STATIC, utcnow()))
+         f"Uploaded {os.path.basename(filename)[:80]} ({_human(size)})", "upload", user_id, provider, utcnow()))
     dep_id = cur.lastrowid
     dest = staged_zip(cfg, project["id"], dep_id)
     try:
@@ -426,6 +773,9 @@ def _queue_upload(db, project, user_id, tmp: Path, filename: str):
     db.execute("INSERT INTO deploy_logs (deployment_id, ts, level, stage, line) VALUES (?,?,?,?,?)",
                (dep_id, utcnow(), "info", "queued",
                 f"Upload #{number} received ({_human(size)}). Waiting for a free build slot…"))
+    if note:
+        db.execute("INSERT INTO deploy_logs (deployment_id, ts, level, stage, line) VALUES (?,?,?,?,?)",
+                   (dep_id, utcnow(), "info", "queued", note))
     db.commit()
     engine.enqueue_deploy(db, dep_id)
     return dep_id
@@ -440,11 +790,16 @@ def create_from_upload():
     name = str(request.form.get("name") or "").strip()[:64]
     if not name:
         return err("Give your project a name.")
-    limit = PLAN_LIMITS.get(user["plan"], PLAN_LIMITS["hobby"])["projects"]
+    limit = plans.project_limit(db, user)
     if user["role"] != "admin":
+        try:
+            plans.ensure_can_create(db, user)
+        except PlanBlocked as exc:
+            return err(exc.message, 402)
         count = db.execute("SELECT COUNT(*) AS n FROM projects WHERE owner_id = ?", (user["id"],)).fetchone()["n"]
         if count >= limit:
-            return err(f"Your {user['plan'].title()} plan allows {limit} projects. Delete one or upgrade.", 402)
+            return err(f"Your {user['plan'].title()} plan allows {limit} project{'s' if limit != 1 else ''}. "
+                       "Delete one or upgrade.", 402)
     custom = str(request.form.get("slug") or "").strip().lower()
     if custom:
         if not CUSTOM_SLUG_RE.match(custom) or "--" in custom:
@@ -493,7 +848,8 @@ def create_from_upload():
 @bp.post("/api/projects/<slug>/upload")
 @login_required
 def reupload(slug):
-    """Upload a new version. Free projects keep their original 24-hour expiry."""
+    """Upload a new version. Free projects keep their original 24-hour expiry, and cannot be
+    uploaded again once it has passed."""
     p = _load_project(slug)
     if p is None:
         return err("Project not found.", 404)
@@ -502,6 +858,10 @@ def reupload(slug):
     if p["is_paused"]:
         return err("This project is paused. Resume it in Settings to upload.", 409)
     user, db = current_user(), get_db()
+    try:
+        plans.ensure_can_deploy(db, p)   # a free project cannot be uploaded again once its 24 hours end
+    except PlanBlocked as exc:
+        return err(exc.message, 402)
     if rate_limit(db, f"upload:{user['id']}", limit=20, per_seconds=300):
         return err("You're uploading very frequently. Wait a moment and try again.", 429)
     try:

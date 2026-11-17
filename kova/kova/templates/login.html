@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <title>Log in or create account · {{ platform_name }}</title>
+  <title>Log In or create account · {{ platform_name }}</title>
   <link rel="icon" href="{{ url_for('static', filename='images/favicon.ico') }}" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='images/favicon-32.png') }}">
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='images/apple-touch-icon.png') }}">
@@ -16,7 +16,7 @@
   <section class="login-art">
     <a class="brand" href="/login"><span class="brand-mark"><img src="{{ url_for('static', filename='images/codeskys-mark.png') }}" alt="" style="width:100%;height:100%;object-fit:contain"></span><span>{{ platform_name }}</span></a>
     <h1>Ship your code to <em>the world.</em></h1>
-    <p>Connect a Git repository and {{ platform_name }} builds, deploys and hosts it — with live logs, instant rollbacks and your own domains.</p>
+    <p>Upload your project or connect a Git repository and {{ platform_name }} puts it online with a live, shareable link.</p>
     <div class="term" aria-hidden="true">
       <div class="dots"><i></i><i></i><i></i></div>
       <div><span class="p">$</span> codeskys deploy <span class="ac">portfolio-site</span></div>
@@ -33,7 +33,7 @@
       <h2 id="auth-title">Welcome back</h2>
       <p class="sub" id="auth-subtitle">Sign in to your Codeskys workspace.</p>
       <div class="auth-tabs" role="tablist" aria-label="Account access">
-        <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Log in</button>
+        <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Log In</button>
         <button class="auth-tab" id="register-tab" type="button" role="tab" aria-selected="false">Create account</button>
       </div>
       <form id="login-form" novalidate>
@@ -47,11 +47,25 @@
         </div>
         <div class="field">
           <label for="password">Password</label>
-          <input class="input" id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" minlength="12" required>
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required>
           <span class="hint" id="password-hint">Use your Codeskys account password.</span>
+          <div id="pw-extras"></div>
         </div>
         <p id="login-error" class="form-error" role="alert" aria-live="polite"></p>
-        <button class="btn accent lg block" type="submit" id="login-btn">Log in</button>
+        <button class="btn accent lg block" type="submit" id="login-btn">Log In</button>
+      </form>
+      <form id="verify-form" class="hidden" novalidate>
+        <div class="verify-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m3.5 7 8.5 6 8.5-6"/></svg></div>
+        <h2>Check your email</h2>
+        <p class="sub" id="verify-sub">We sent a 6-digit code to your email.</p>
+        <div class="field">
+          <label for="otp">Verification code</label>
+          <input class="input otp-input" id="otp" name="otp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="••••••" pattern="[0-9]*" required>
+        </div>
+        <p id="verify-error" class="form-error" role="alert" aria-live="polite"></p>
+        <button class="btn accent lg block" type="submit" id="verify-btn">Verify and create account</button>
+        <p class="auth-switch"><span id="resend-note">Didn't get it?</span> <button type="button" id="resend-btn">Resend code</button></p>
+        <p class="auth-switch"><button type="button" id="verify-back">Use a different email</button></p>
       </form>
       <p class="auth-switch" id="auth-switch">New to Codeskys? <button type="button" id="switch-register">Create an account</button></p>
       <div class="fine">
@@ -62,6 +76,7 @@
   </section>
 </div>
 <script src="{{ url_for('static', filename='js/api.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pwtools.js') }}"></script>
 <script src="{{ url_for('static', filename='js/login.js') }}"></script>
 </body>
 </html>

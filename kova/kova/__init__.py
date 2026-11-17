@@ -18,6 +18,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     if test_config:
         app.config.update(test_config)
 
+    if app.config.get("TRUSTED_PROXIES"):
+        # Behind Caddy every request arrives from the proxy; trust its X-Forwarded-For so each visitor is
+        # counted by their own address (not one shared address for everybody).
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=int(app.config["TRUSTED_PROXIES"]))
     dbmod.migrate(app.config["DATABASE"])
     app.teardown_appcontext(dbmod.close_db)
     _bootstrap_admin(app)
@@ -35,9 +40,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     from .billing import bp as billing_bp
     from .tlsask import bp as tlsask_bp
     from .uploads import bp as uploads_bp
+    from .upi import bp as upi_bp
 
     for blueprint in (auth_bp, status_bp, pages_bp, projects_bp, account_bp, admin_bp, sites_bp,
-                      providers_bp, webhooks_bp, forms_bp, billing_bp, tlsask_bp, uploads_bp):
+                      providers_bp, webhooks_bp, forms_bp, billing_bp, tlsask_bp, uploads_bp, upi_bp):
         app.register_blueprint(blueprint)
 
     # Job handlers register themselves on import; the worker needs them loaded.
@@ -90,6 +96,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             expected = session.get("csrf", "")
             if not expected or not hmac.compare_digest(sent, expected):
                 return jsonify(error="Your session expired. Reload the page and try again."), 403
+
+    from .browsers import attach_cookie
+    app.after_request(attach_cookie)
 
     @app.after_request
     def security_headers(resp):

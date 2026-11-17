@@ -9,7 +9,7 @@ from kova.composegen import ComposeError, _inline_problem, compose_escape
 from kova.dockerfiles import DockerfileError
 from kova.gitinfo import FRAMEWORKS
 
-FRAMEWORK_IDS = [f for f in FRAMEWORKS if f != "docker"]
+FRAMEWORK_IDS = [f for f in FRAMEWORKS if f not in ("docker", "compose")]   # those build from the repository
 SHA = "c" * 40
 DEP = "dep_abcdef0123456789"
 
@@ -24,8 +24,8 @@ def doc_with(inline):
 
 
 class Generation(unittest.TestCase):
-    def test_all_fifteen_framework_presets_generate_a_valid_dockerfile(self):
-        self.assertEqual(len(FRAMEWORK_IDS), 15)
+    def test_every_framework_preset_generates_a_valid_dockerfile(self):
+        self.assertEqual(len(FRAMEWORK_IDS), 19)
         for fw in FRAMEWORK_IDS:
             with self.subTest(fw=fw):
                 text, port = dockerfiles.generate({"framework": fw})

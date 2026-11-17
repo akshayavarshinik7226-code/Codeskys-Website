@@ -76,26 +76,105 @@ class AuthTests(AppTestCase):
         me = self.client.get("/api/auth/me").get_json()
         self.assertEqual(me["user"]["email"], ADMIN[0])
 
-    def test_student_can_register_and_is_signed_in(self):
-        r = self.post("/api/auth/register", {"name": "New Student", "email": "new@example.test", "password": "a-long-password-123"})
-        self.assertEqual(r.status_code, 201)
-        self.assertEqual(r.get_json()["user"]["role"], "student")
-        self.assertEqual(self.client.get("/api/auth/me").get_json()["user"]["email"], "new@example.test")
-        self.assertNotIn("password_hash", r.get_data(as_text=True))
+    NEW = {"name": "New Student", "email": "new.student@gmail.com", "password": "Maple-River-Lamp-47!"}
+
+    def _code(self):
+        """The 6-digit code from the most recent email 'sent' by the app."""
+        import re
+        body = self.app.config["MAIL_OUTBOX"][-1]["text"]
+        return re.search(r"\b(\d{6})\b", body).group(1)
+
+    def test_signup_needs_an_email_code_before_the_account_exists(self):
+        r = self.post("/api/auth/register", self.NEW)
+        self.assertEqual(r.status_code, 202, r.get_json())
+        self.assertTrue(r.get_json()["verify"])
+        # Nothing is created or signed in yet, and the code is never in the response.
+        self.assertIsNone(self.client.get("/api/auth/me").get_json()["user"])
+        self.assertNotIn(self._code(), r.get_data(as_text=True))
+        conn = connect(self.app.config["DATABASE"])
+        self.assertIsNone(conn.execute("SELECT 1 FROM users WHERE email = ?", (self.NEW["email"],)).fetchone())
+        row = conn.execute("SELECT * FROM pending_signups").fetchone()
+        self.assertNotIn(self._code(), row["code_hash"])   # only a hash is stored
+        conn.close()
+        ok = self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": self._code()})
+        self.assertEqual(ok.status_code, 201, ok.get_json())
+        self.assertEqual(ok.get_json()["user"]["role"], "student")
+        self.assertEqual(self.client.get("/api/auth/me").get_json()["user"]["email"], self.NEW["email"])
+        self.assertNotIn("password_hash", ok.get_data(as_text=True))
+        # And the password chosen in step 1 is the one that works.
+        other = self.app.test_client()
+        self.assertEqual(self.login(self.NEW["email"], self.NEW["password"], client=other).status_code, 200)
+
+    def test_wrong_code_is_refused_and_locks_after_five_tries(self):
+        self.post("/api/auth/register", self.NEW)
+        right = self._code()
+        wrong = "000000" if right != "000000" else "111111"
+        for _ in range(4):
+            self.assertEqual(self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": wrong}).status_code, 400)
+        locked = self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": wrong})
+        self.assertEqual(locked.status_code, 429)
+        # Even the right code no longer works: the sign-up must be started again.
+        self.assertEqual(self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": right}).status_code, 404)
+
+    def test_expired_code_is_refused(self):
+        self.post("/api/auth/register", self.NEW)
+        conn = connect(self.app.config["DATABASE"])
+        conn.execute("UPDATE pending_signups SET expires_at = '2000-01-01T00:00:00+00:00'")
+        conn.commit(); conn.close()
+        r = self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": self._code()})
+        self.assertEqual(r.status_code, 410)
+
+    def test_resend_is_throttled_then_issues_a_new_code(self):
+        self.post("/api/auth/register", self.NEW)
+        first = self._code()
+        self.assertEqual(self.post("/api/auth/register/resend", {"email": self.NEW["email"]}).status_code, 429)
+        conn = connect(self.app.config["DATABASE"])
+        conn.execute("UPDATE pending_signups SET last_sent_at = '2000-01-01T00:00:00+00:00'")
+        conn.commit(); conn.close()
+        self.assertEqual(self.post("/api/auth/register/resend", {"email": self.NEW["email"]}).status_code, 200)
+        self.assertEqual(len(self.app.config["MAIL_OUTBOX"]), 2)
+        if self._code() != first:   # the first code is dead once a new one is issued
+            self.assertEqual(self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": first}).status_code, 400)
 
     def test_public_registration_cannot_create_admin(self):
-        r = self.post("/api/auth/register", {"name": "Not Admin", "email": "newadmin@example.test", "password": "a-long-password-123", "role": "admin"})
-        self.assertEqual(r.status_code, 201)
-        self.assertEqual(r.get_json()["user"]["role"], "student")
+        r = self.post("/api/auth/register", {**self.NEW, "role": "admin"})
+        self.assertEqual(r.status_code, 202)
+        ok = self.post("/api/auth/register/verify", {"email": self.NEW["email"], "code": self._code()})
+        self.assertEqual(ok.get_json()["user"]["role"], "student")
 
-    def test_registration_rejects_duplicate_email_and_short_password(self):
-        duplicate = self.post("/api/auth/register", {"name": "Duplicate", "email": ADMIN[0], "password": "a-long-password-123"})
-        short = self.post("/api/auth/register", {"name": "Short Password", "email": "short@example.test", "password": "short"})
-        self.assertEqual(duplicate.status_code, 400)
-        self.assertEqual(short.status_code, 400)
+    def test_fake_and_disposable_emails_are_blocked(self):
+        for bad in ("test@gmail.com", "someone@mailinator.com", "me@example.com", "aaaa@gmail.com",
+                    "no-at-sign", "a@b", "x@localhost", "name@domain.test"):
+            r = self.post("/api/auth/register", {**self.NEW, "email": bad})
+            self.assertEqual(r.status_code, 400, bad)
+        self.assertEqual(self.app.config.get("MAIL_OUTBOX", []), [])   # nothing was emailed
+
+    def test_weak_passwords_are_blocked(self):
+        for weak in ("short1A!", "alllowercase123!", "ALLUPPERCASE123!", "NoNumbersHere!!", "NoSymbols12345Ab",
+                     "Password@12345", "aaaaaaaaaaaA1!"):
+            r = self.post("/api/auth/register", {**self.NEW, "password": weak})
+            self.assertEqual(r.status_code, 400, weak)
+        self.assertEqual(self.app.config.get("MAIL_OUTBOX", []), [])
+
+    def test_existing_accounts_can_still_log_in_with_older_weaker_passwords(self):
+        # Rules apply when a password is CREATED. Logging in never re-checks the rules.
+        self.assertEqual(self.login(STUDENT[0], STUDENT[2]).status_code, 200)
+
+    def test_duplicate_email_is_refused(self):
+        conn = connect(self.app.config["DATABASE"])
+        create_user(conn, "taken@gmail.com", "Taken", "Maple-River-Lamp-47!", "student")
+        conn.close()
+        r = self.post("/api/auth/register", {**self.NEW, "email": "taken@gmail.com"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.app.config.get("MAIL_OUTBOX", []), [])
+
+    def test_otp_can_be_switched_off(self):
+        self.app.config["EMAIL_OTP_REQUIRED"] = False
+        r = self.post("/api/auth/register", self.NEW)
+        self.assertEqual(r.status_code, 201)
 
     def test_registration_requires_csrf(self):
-        r = self.client.post("/api/auth/register", json={"name": "New", "email": "new@example.test", "password": "a-long-password-123"})
+        r = self.client.post("/api/auth/register", json={"name": "New", "email": "new@gmail.com", "password": "Maple-River-Lamp-47!"})
         self.assertEqual(r.status_code, 403)
 
     def test_email_is_case_insensitive(self):

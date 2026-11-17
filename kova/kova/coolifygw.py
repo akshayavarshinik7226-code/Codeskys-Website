@@ -23,7 +23,8 @@ Run inside the website image::
 Settings (environment): ``COOLIFY_UPSTREAM`` (``http://coolify:8080``),
 ``COOLIFY_TOKEN_FILE``, ``GW_PROJECT_UUID``, ``GW_SERVER_UUID``,
 ``GW_DESTINATION_UUID``, ``GW_ENVIRONMENT`` (``production``), ``GW_BASE_DOMAIN``
-(``apps.codeskys.com``), ``GW_LISTEN`` (``0.0.0.0:8080``).
+(``apps.codeskys.com``), ``GW_LISTEN`` (``0.0.0.0:8080``), ``GW_BUILD_SOURCE_URL``
+(``http://172.23.0.11:8000``; ``none`` refuses uploaded projects).
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .composegen import ComposeError, assert_safe_service, coolify_reserved
+from .composegen import build_contexts, ComposeError, assert_safe_service, coolify_reserved
 
 MAX_BODY = 1 << 20
 _UUID = r"[a-z0-9]{8,64}"
@@ -75,6 +76,9 @@ class Refused(ValueError):
     """The request is not one Codeskys makes; it is not forwarded."""
 
 
+DEFAULT_BUILD_SOURCE_URL = "http://172.23.0.11:8000"
+
+
 def settings(env=os.environ) -> dict:
     return {
         "upstream": env.get("COOLIFY_UPSTREAM", "http://coolify:8080").rstrip("/"),
@@ -85,6 +89,10 @@ def settings(env=os.environ) -> dict:
         "environment_name": env.get("GW_ENVIRONMENT", "production"),
         "base_domain": env.get("GW_BASE_DOMAIN", "apps.codeskys.com").strip(".").lower(),
         "listen": env.get("GW_LISTEN", "0.0.0.0:8080"),
+        # The website address the build server fetches uploaded projects from: by default the
+        # website's pinned address on codeskys-coolify-api (Option B). "none" allows no upload.
+        "build_source_url": ("" if env.get("GW_BUILD_SOURCE_URL", "").strip().lower() == "none" else
+                             env.get("GW_BUILD_SOURCE_URL", "").strip().rstrip("/") or DEFAULT_BUILD_SOURCE_URL),
     }
 
 
@@ -133,6 +141,13 @@ def check_service(body, cfg: dict, create: bool) -> None:
         _need(m and (slug is None or m.group(1) == slug), "description must be the Codeskys ownership marker")
         slug = slug or m.group(1)
     doc = _compose(body["docker_compose_raw"]) if "docker_compose_raw" in body else None
+    if doc is not None:
+        for context in build_contexts(doc):
+            if not context.startswith("https://github.com/"):
+                # An uploaded project: only ever from the configured website address, never another host.
+                base = cfg.get("build_source_url", "")
+                _need(base and context.startswith(base + "/internal/build-source/"),
+                      "the build context must be a GitHub repository or the Codeskys build-source address")
     if "urls" in body:
         _need(doc is not None, "a URL change needs the compose file")
         urls = body["urls"]

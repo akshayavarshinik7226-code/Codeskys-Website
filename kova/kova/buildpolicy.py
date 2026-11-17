@@ -67,6 +67,11 @@ def dockerfile_problems(text: str) -> list[str]:
             problems.append(f"'{m.group(0)}' is not allowed (in: {s[:80]})")
     if not _FROM.search(joined):
         problems.append("no FROM instruction (is the Dockerfile a symlink?)")
+    from .multiservice import VULNERABLE
+    for m in re.finditer(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)", joined, re.I | re.M):
+        if VULNERABLE.search(m.group(1)):
+            problems.append(f"it is based on {m.group(1)[:80]}, an intentionally vulnerable training application "
+                            "that Codeskys never puts on the internet")
     return problems
 
 
@@ -84,8 +89,9 @@ def fetch_dockerfile(repo_url: str, commit_sha: str, path: str = "Dockerfile", t
         raise PolicyError("Could not read the Dockerfile from GitHub. Try again in a moment.") from None
     with r:
         if r.status_code == 404:
-            raise PolicyError(f"The repository has no {path} at its root for this commit. "
-                              "Deployments are built from your own Dockerfile.")
+            raise PolicyError(f"The repository has no {path} for this commit, and Codeskys found no app it can build "
+                              "without one. Choose your framework in Project → Settings, or set the Root directory "
+                              "if the app is in a folder.")
         if r.status_code != 200:
             raise PolicyError(f"Could not read the Dockerfile from GitHub (HTTP {r.status_code}). Try again.")
         data = r.raw.read(MAX_DOCKERFILE_BYTES + 1, decode_content=True)
@@ -94,10 +100,50 @@ def fetch_dockerfile(repo_url: str, commit_sha: str, path: str = "Dockerfile", t
     return data.decode("utf-8", errors="replace")
 
 
-def check_dockerfile(repo_url: str, commit_sha: str, path: str = "Dockerfile") -> None:
-    problems = dockerfile_problems(fetch_dockerfile(repo_url, commit_sha, path))
+_FILE_PATH = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+
+
+def fetch_file(repo_url: str, commit_sha: str, path: str, timeout: float = 15.0) -> str | None:
+    """One small file of a public GitHub repository at the exact commit, or None when it does not
+    exist. raw.githubusercontent.com is not part of the API rate limit."""
+    m = _GITHUB.match((repo_url or "").rstrip("/").removesuffix(".git"))
+    if not m or not _SHA.match(commit_sha or "") or not _FILE_PATH.match(path or "") or ".." in path.split("/"):
+        raise PolicyError("Only files of public GitHub repositories at an exact commit can be read.")
+    url = f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/{commit_sha}/{path}"
+    try:
+        r = requests.get(url, timeout=timeout, stream=True, allow_redirects=False)
+    except requests.RequestException:
+        raise PolicyError(f"Could not read {path} from GitHub. Try again in a moment.") from None
+    with r:
+        if r.status_code == 404:
+            return None
+        if r.status_code != 200:
+            raise PolicyError(f"Could not read {path} from GitHub (HTTP {r.status_code}). Try again.")
+        data = r.raw.read(MAX_DOCKERFILE_BYTES + 1, decode_content=True)
+    if len(data) > MAX_DOCKERFILE_BYTES:
+        raise PolicyError(f"{path} is larger than 256 KB.")
+    return data.decode("utf-8", errors="replace")
+
+
+def check_dockerfile(repo_url: str, commit_sha: str, path: str = "Dockerfile") -> str:
+    """The Dockerfile's text once it passed :func:`dockerfile_problems`."""
+    text = fetch_dockerfile(repo_url, commit_sha, path)
+    problems = dockerfile_problems(text)
     if problems:
         raise PolicyError("This Dockerfile cannot be built on Codeskys: " + "; ".join(problems) + ".")
+    return text
+
+
+def exposed_port(text: str) -> int | None:
+    """The one port a Dockerfile EXPOSEs, or None (none, several, or a variable)."""
+    ports = set()
+    for m in re.finditer(r"^\s*EXPOSE\s+(.+)$", text or "", re.I | re.M):
+        for word in m.group(1).split():
+            num = word.split("/")[0]
+            if not num.isdigit():
+                return None
+            ports.add(int(num))
+    return ports.pop() if len(ports) == 1 and 1 <= next(iter(ports)) <= 65535 else None
 
 
 def coolify_service_problems(service: dict, expected_compose: dict | None = None) -> list[str]:
@@ -117,9 +163,11 @@ def coolify_service_problems(service: dict, expected_compose: dict | None = None
     if service.get("connect_to_docker_network"):
         problems.append("it is connected to the destination's Docker network")
     names = sorted(a.get("name") for a in service.get("applications") or [] if isinstance(a, dict))
-    if names != ["app"] or service.get("databases"):
-        problems.append(f"its containers are {names + ['(database)'] * len(service.get('databases') or [])}, "
-                        "not one 'app'")
+    databases = sorted(d.get("name") for d in service.get("databases") or [] if isinstance(d, dict))
+    expected = sorted((expected_compose or {}).get("services") or {}) or ["app"]
+    if "app" not in names or sorted(names + databases) != expected:
+        problems.append(f"its containers are {names + databases}, not "
+                        + ("one 'app'" if expected == ["app"] else str(expected)))
     if "docker_compose_raw" in service:
         try:
             stored = json.loads(service.get("docker_compose_raw") or "")
@@ -209,6 +257,9 @@ def repository_files(repo_url: str, commit_sha: str, timeout: float = 10.0):
             headers["Authorization"] = f"Bearer {api_token()}"
         r = requests.get(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}/git/trees/{commit_sha}",
                          params={"recursive": "1"}, timeout=timeout, allow_redirects=False, headers=headers)
+        if r.status_code in (403, 429):
+            # The API's hourly limit for this server: list the files from the source archive instead.
+            return archive_files(m.group(1), m.group(2), commit_sha)
         if r.status_code != 200:
             return None
         body = r.json()
@@ -219,6 +270,39 @@ def repository_files(repo_url: str, commit_sha: str, timeout: float = 10.0):
     return {e["path"] for e in body.get("tree", []) if e.get("type") == "blob" and isinstance(e.get("path"), str)}
 
 
+ARCHIVE_LIST_BYTES = 150 * 1024 * 1024
+ARCHIVE_LIST_SECONDS = 40
+
+
+def archive_files(owner: str, repo: str, commit_sha: str):
+    """File paths at the commit from codeload.github.com's tarball (not under the API's hourly limit).
+    Only names are read; the download stops at ARCHIVE_LIST_BYTES or ARCHIVE_LIST_SECONDS (None)."""
+    import tarfile
+    import time
+    url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/{commit_sha}"
+    deadline, seen = time.monotonic() + ARCHIVE_LIST_SECONDS, [0]
+    try:
+        r = requests.get(url, stream=True, timeout=15, allow_redirects=False)
+        if r.status_code != 200:
+            return None
+
+        class Capped:
+            def read(self, n=-1):
+                if seen[0] > ARCHIVE_LIST_BYTES or time.monotonic() > deadline:
+                    raise OSError("archive too large or too slow to list")
+                data = r.raw.read(n if n and n > 0 else 1 << 20)
+                seen[0] += len(data)
+                return data
+        files = set()
+        with r, tarfile.open(fileobj=Capped(), mode="r|gz") as tar:
+            for member in tar:
+                if member.isfile():
+                    files.add(member.name.split("/", 1)[1] if "/" in member.name else member.name)
+        return {f for f in files if f}
+    except (requests.RequestException, tarfile.TarError, OSError, EOFError):
+        return None
+
+
 def entrypoint_problem(project, settings: dict, files) -> str:
     """Why the preset's commands cannot work in this repository, or "" (unknown counts as fine)."""
     if files is None:
@@ -227,6 +311,11 @@ def entrypoint_problem(project, settings: dict, files) -> str:
     under = (lambda p: f"{root}/{p}" if root else p)
     rel = {f[len(root) + 1:] if root else f for f in files if not root or f.startswith(root + "/")}
     needs = required_files(settings.get("install", ""), settings.get("start", ""))
+    if settings.get("framework") == "docs":
+        if not any(p.endswith(".ipynb") or p.rsplit("/", 1)[-1].lower().startswith("readme") for p in rel):
+            return ("There is nothing to preview: the project has no notebooks (.ipynb) and no README. "
+                    "Choose the framework your app uses in Project → Settings.")
+        return ""
     if settings.get("static") and not settings.get("install") and not settings.get("build"):
         out = (settings.get("output") or "").strip("/")
         needs.append(("an index.html (the site's home page)", [f"{out}/index.html" if out else "index.html"]))
@@ -243,7 +332,8 @@ def entrypoint_problem(project, settings: dict, files) -> str:
     compose = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} & rel
     dockerfiles = [p for p in rel if "/" not in p and p.startswith("Dockerfile.")]
     if compose and (dockerfiles or len(entries) > 1):
-        msg.append("It is a multi-service Docker Compose project; a Codeskys project runs one service.")
+        msg.append("It has a docker-compose file: choose Docker Compose (multi-service) in Project → Settings to "
+                   "run all of its services.")
     example = _example_start(settings.get("start", ""), entries)
     msg.append("Set the Install command, Start command and Port in Project → Settings for the part you want "
                "to run" + (f" (for example: {example})" if example else "") + ", then deploy again.")
