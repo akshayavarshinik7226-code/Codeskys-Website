@@ -62,6 +62,13 @@ strong-password suggester; project rename also renames the live link (with an av
 - UPI QR codes (Rs 510 and Rs 1,599, Codeskys logo in the centre, verified to scan) on the payment page.
 - `python manage.py test-email --to <address>` checks the email settings. See `docs/EMAIL_AND_NEXT_STEPS.md`.
 
+## Round 4 (18 Nov)
+- **Updates show immediately.** Every static file address now carries `?v=<hash of the files>` and is cached for good only
+  under that version; un-versioned files always re-check. Before, browsers could keep an old `app.js` for hours, so a new
+  Billing page or menu looked "not updated" on a live site that had already been updated.
+- Administrators see the **build id** in the sidebar next to the engine name (`build abc123def4`). If it does not change
+  after a release, the container is still running the old files.
+
 ## Steps to deploy (same way as the last update)
 
 1. **Back up first**: `cp -a /srv/codeskys/website/instance /root/instance.backup-$(date +%F)` and copy

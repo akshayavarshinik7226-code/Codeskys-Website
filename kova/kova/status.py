@@ -42,6 +42,7 @@ def platform_status():
         engine=engine,
         provider=active_provider(get_db(), current_app.config),
         users=row["n"] if is_admin else None,
+        build=current_app.config.get("ASSET_VERSION") if is_admin else None,
     )
     if is_admin:
         out["coolify"] = engine | {"host": urlparse(url).netloc if url else None}

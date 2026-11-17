@@ -11,6 +11,23 @@ from .users import ValidationError, create_user
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
+def _asset_version(app) -> str:
+    """A short hash of the static files (names, sizes, times): it changes whenever a release changes them."""
+    import hashlib
+    h = hashlib.sha1()
+    root = os.path.join(app.root_path, "static")
+    for folder, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            p = os.path.join(folder, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            h.update(f"{os.path.relpath(p, root)}|{st.st_size}|{int(st.st_mtime)}".encode())
+    return h.hexdigest()[:10]
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     load_dotenv()
     app = Flask(__name__)
@@ -99,6 +116,23 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     from .browsers import attach_cookie
     app.after_request(attach_cookie)
+
+    # Always show people the newest screens after an update. Every static file address gets ?v=<hash of the
+    # files>, so a new release is fetched at once instead of the browser re-using an old copy for hours.
+    asset_version = _asset_version(app)
+    app.config["ASSET_VERSION"] = asset_version      # shown to administrators as the "build" id
+
+    @app.url_defaults
+    def _version_static(endpoint, values):
+        if endpoint == "static" and "v" not in values:
+            values["v"] = asset_version
+
+    @app.after_request
+    def _static_caching(resp):
+        if request.endpoint == "static" and resp.status_code == 200:
+            resp.headers["Cache-Control"] = ("public, max-age=31536000, immutable" if request.args.get("v")
+                                             else "no-cache")        # un-versioned: always re-check
+        return resp
 
     @app.after_request
     def security_headers(resp):

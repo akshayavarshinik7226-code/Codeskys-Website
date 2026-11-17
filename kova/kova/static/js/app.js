@@ -289,7 +289,7 @@
       const foot = el("div", "side-foot");
       const prov = State.status && State.status.provider === "coolify";
       foot.append(el("div", "provider-pill", svg(prov ? "shield" : "bolt", "sm") +
-        "<span>Engine: <b style='color:var(--ink)'>" + engineLabel(prov ? "coolify" : "simulator") + "</b></span>"));
+        "<span>Engine: <b style='color:var(--ink)'>" + engineLabel(prov ? "coolify" : "simulator") + "</b>" + (State.status && State.status.build ? " · build <code>" + esc(State.status.build) + "</code>" : "") + "</span>"));
       s.append(foot);
     }
   }
